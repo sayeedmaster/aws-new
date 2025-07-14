@@ -19,6 +19,7 @@
 .NOTES
     The script will prompt you interactively for:
     - SSO start URL (e.g., https://ipfeu.awsapps.com/start)
+    - SSO start URL (e.g., https://cloudwick-aws.awsapps.com/start
     - SSO region (e.g., eu-west-1)
     - Default region for all profiles (e.g., eu-west-1)
     
@@ -35,6 +36,14 @@ param(
     [string]$Prefix = 'sso'          # profile names look like sso-Prod-Admin
 )
 
+# ----------------------------  Script Explanation  ----------------------------
+Write-Host "" -ForegroundColor Cyan
+Write-Host "This script will authenticate with AWS SSO and create a base profile interactively." -ForegroundColor Cyan
+Write-Host "After successful authentication, it will iterate through your SSO cache and automatically generate profiles for every available Account and Role you can access." -ForegroundColor Cyan
+Write-Host "You only need to provide your SSO details once; all other profiles are created for you." -ForegroundColor Cyan
+Write-Host "If prompted for a session name, just type in 'base' to use the base profile." -ForegroundColor Cyan
+Write-Host "" -ForegroundColor Cyan
+
 # ----------------------------  0. Paths  ------------------------------------
 $AwsDir      = Join-Path $env:USERPROFILE '.aws'
 $configPath  = Join-Path $AwsDir 'config'
@@ -45,11 +54,18 @@ Write-Host "==============================" -ForegroundColor Cyan
 Write-Host ""
 
 # ----------------------------  1. Backup & wipe  ----------------------------
+
+# Always clean config and sso cache directory before setup
 if (Test-Path $configPath) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     Copy-Item $configPath "$configPath.bak-$stamp"
-    Remove-Item $configPath
     Write-Host "Existing config backed-up to $($configPath).bak-$stamp" -ForegroundColor Green
+    Remove-Item $configPath -Force
+}
+
+if (Test-Path $cacheDir) {
+    Write-Host "Cleaning SSO cache directory: $cacheDir" -ForegroundColor Yellow
+    Remove-Item $cacheDir -Recurse -Force
 }
 
 # ----------------------------  2. Base profile  -----------------------------
@@ -70,6 +86,8 @@ Write-Host ""
 # This handles the browser authentication and creates a proper SSO profile
 Write-Host "Running 'aws configure sso --profile $base'..." -ForegroundColor Yellow
 aws configure sso --profile $base
+Read-Host "Press Enter after you have completed the interactive SSO setup in the browser and CLI"
+Start-Sleep -Seconds 2  # Wait for config to be written
 
 # Verify the SSO login was successful by checking if cache exists
 if (!(Test-Path $cacheDir)) { 
@@ -83,9 +101,24 @@ Write-Host "SSO authentication successful!" -ForegroundColor Green
 # ----------------------------  4. Read SSO Configuration  ------------------
 Write-Host "`nReading SSO configuration from base profile..." -ForegroundColor Cyan
 
-# Get the SSO configuration that was set up interactively
-$baseStartUrl = aws configure get sso_start_url --profile $base
-$baseSsoRegion = aws configure get sso_region --profile $base
+
+# Parse config file to get session values
+$sessionName = aws configure get sso_session --profile $base
+$configLines = Get-Content $configPath
+$sessionSection = $false
+$baseStartUrl = $null
+$baseSsoRegion = $null
+foreach ($line in $configLines) {
+    if ($line -match "^\[sso-session $sessionName\]") {
+        $sessionSection = $true
+        continue
+    }
+    if ($sessionSection) {
+        if ($line -match "^\[") { $sessionSection = $false; continue }
+        if ($line -match "^sso_start_url\s*=\s*(.+)") { $baseStartUrl = $Matches[1].Trim() }
+        if ($line -match "^sso_region\s*=\s*(.+)") { $baseSsoRegion = $Matches[1].Trim() }
+    }
+}
 $baseRegion = aws configure get region --profile $base
 
 if (-not $baseStartUrl -or -not $baseSsoRegion) {

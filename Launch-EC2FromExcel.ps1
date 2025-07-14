@@ -3,7 +3,7 @@
 
 # Requires AWSPowerShell.NetCore and ImportExcel module
 # Prerequisites:
-# 1. AWSPowerShell.NetCore module located at D:\psmodules
+# 1. AWSPowerShell.NetCore module located at C:\psmodules
 # 2. Install-Module -Name ImportExcel
 # 3. AWS CLI installed and configured with SSO profiles for each AccountName in the Excel file
 # 4. Excel file with EC2 configuration (see sample layout below)
@@ -11,10 +11,6 @@
 param (
     [Parameter(Mandatory=$true)]
     [string]$ExcelFilePath,
-    [Parameter(Mandatory=$true)]
-    [string]$SSORoleName,
-    [Parameter(Mandatory=$true)]
-    [string]$SSOStartUrl,
     [Parameter(Mandatory=$false)]
     [string]$LogFilePath = ".\EC2_Launch_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 )
@@ -32,9 +28,32 @@ function Write-Log {
 }
 
 try {
-    # Import required modules from specified path
-    Import-Module -Name "$env:D:\psmodules\AWSPowerShell.NetCore" -ErrorAction Stop
-    Import-Module -Name ImportExcel -ErrorAction Stop
+
+    # Prompt user to select the AWSPowerShell.NetCore module directory
+    Write-Host "Please enter the path to the directory containing AWSPowerShell.NetCore (e.g., c:\psmodules) or press Enter to browse." -ForegroundColor Cyan
+    $psmodulesDirInput = Read-Host "Path to psmodules directory"
+    if (-not $psmodulesDirInput) {
+        Add-Type -AssemblyName System.Windows.Forms
+        $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+        $folderBrowser.Description = "Select the directory containing AWSPowerShell.NetCore"
+        if ($folderBrowser.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $psmodulesDir = $folderBrowser.SelectedPath
+        } else {
+            Write-Host "No directory selected. Exiting." -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        $psmodulesDir = $psmodulesDirInput
+    }
+
+    # Import required modules from selected path
+    try {
+        Import-Module -Name "$psmodulesDir\AWSPowerShell.NetCore" -ErrorAction Stop
+        Import-Module -Name "$psmodulesDir\ImportExcel"  -ErrorAction Stop
+    } catch {
+        Write-Log "Failed to import modules from $psmodulesDir. Error: $($_.Exception.Message)" "ERROR"
+        exit 1
+    }
 
     Write-Log "Starting EC2 launch script"
 
@@ -50,33 +69,88 @@ try {
     }
     Write-Log "Found $($ec2Configs.Count) EC2 configurations in Excel"
 
+    # Path to AWS config file
+    $awsConfigPath = "$env:USERPROFILE\.aws\config"
+    if (-not (Test-Path $awsConfigPath)) {
+        throw "AWS config file not found: $awsConfigPath"
+    }
+
+    # Read config file into lines
+    $configLines = Get-Content -Path $awsConfigPath
+
     # Process each EC2 configuration
     foreach ($config in $ec2Configs) {
         try {
             $accountId = $config.AccountId
             $accountName = $config.AccountName
-            $region = ($config.AvailabilityZone -split '-')[0..2] -join '-'  # Extract region from AZ
+            $ssoRole = $config.SSORole
             $instanceName = $config.InstanceName
-            
-            Write-Log "Processing EC2 configuration for Account: $accountId ($accountName), Region: $region, Instance: $instanceName"
 
-            # Authenticate using AWS SSO for the specific account
-            Write-Log "Initiating AWS SSO authentication for profile: $accountName"
-            try {
-                $ssoCredentials = Get-SSOToken -ProfileName $accountName -StartUrl $SSOStartUrl -ErrorAction Stop
-                Write-Log "SSO authentication successful for profile: $accountName"
-            } catch {
-                Write-Log "Failed to authenticate with SSO profile: $accountName. Error: $($_.Exception.Message)" "ERROR"
+            # Derive AWS profile name from AccountName and SSORole (AWS CLI convention: sso-AccountName-SSORole)
+            $profileName = "sso-$accountName-$ssoRole"
+
+            # Find profile section in config file
+            $profileHeader = "[profile $profileName]"
+            $profileStart = ($configLines | Select-String -Pattern "^$profileHeader$" -SimpleMatch).LineNumber
+            if (-not $profileStart) {
+                Write-Log "Profile section not found in AWS config for: $profileName" "ERROR"
+                continue
+            }
+            # Find next section header after profile
+            $nextHeader = ($configLines[$profileStart..($configLines.Count-1)] | Select-String -Pattern "^\[profile ").LineNumber
+            $profileEnd = $nextHeader ? ($profileStart + $nextHeader[0] - 2) : ($configLines.Count - 1)
+            $profileBlock = $configLines[$profileStart..$profileEnd]
+
+            # Parse sso_start_url from profile block
+            $ssoStartUrl = ($profileBlock | Where-Object { $_ -match '^sso_start_url\s*=\s*(.+)$' }) -replace '^sso_start_url\s*=\s*', ''
+            if (-not $ssoStartUrl) {
+                Write-Log "sso_start_url not found for profile: $profileName" "ERROR"
                 continue
             }
 
-            # Assume role for the target account
-            $roleArn = "arn:aws:iam::$($accountId):role/$SSORoleName"
-            $assumeRoleParams = @{
-                RoleArn = $roleArn
-                RoleSessionName = "EC2LaunchSession_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-                AccessToken = $ssoCredentials.AccessToken
+            # Parse region from profile block
+            $region = ($profileBlock | Where-Object { $_ -match '^region\s*=\s*(.+)$' }) -replace '^region\s*=\s*', ''
+            if (-not $region) {
+                Write-Log "region not found for profile: $profileName" "ERROR"
+                continue
             }
+
+            # Derive AWS profile name from AccountName and SSORole (AWS CLI convention: sso-AccountName-SSORole)
+            $profileName = "sso-$accountName-$ssoRole"
+
+            Write-Log "Processing EC2 configuration for Account: $accountId ($accountName), Region: $region, Instance: $instanceName, Profile: $profileName"
+
+            # Find profile section in config file
+            $profileHeader = "[profile $profileName]"
+            $profileStart = ($configLines | Select-String -Pattern "^$profileHeader$" -SimpleMatch).LineNumber
+            if (-not $profileStart) {
+                Write-Log "Profile section not found in AWS config for: $profileName" "ERROR"
+                continue
+            }
+            # Find next section header after profile
+            $nextHeader = ($configLines[$profileStart..($configLines.Count-1)] | Select-String -Pattern "^\[profile ").LineNumber
+            $profileEnd = $nextHeader ? ($profileStart + $nextHeader[0] - 2) : ($configLines.Count - 1)
+            $profileBlock = $configLines[$profileStart..$profileEnd]
+
+            # Parse sso_start_url from profile block
+            $ssoStartUrl = ($profileBlock | Where-Object { $_ -match '^sso_start_url\s*=\s*(.+)$' }) -replace '^sso_start_url\s*=\s*', ''
+            if (-not $ssoStartUrl) {
+                Write-Log "sso_start_url not found for profile: $profileName" "ERROR"
+                continue
+            }
+
+            # Authenticate using AWS SSO for the specific account/profile
+            Write-Log "Initiating AWS SSO authentication for profile: $profileName"
+            try {
+                $ssoCredentials = Get-SSOToken -ProfileName $profileName -StartUrl $ssoStartUrl -ErrorAction Stop
+                Write-Log "SSO authentication successful for profile: $profileName"
+            } catch {
+                Write-Log "Failed to authenticate with SSO profile: $profileName. Error: $($_.Exception.Message)" "ERROR"
+                continue
+            }
+
+            # Assume role for the target account (from SSORole field in Excel)
+            $roleArn = "arn:aws:iam::$($accountId):role/$ssoRole"
             $roleCredentials = (Get-STSAssumeRoleWithSAML -RoleArn $roleArn -AccessToken $ssoCredentials.AccessToken).Credentials
             Write-Log "Successfully assumed role: $roleArn"
 
