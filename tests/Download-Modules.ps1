@@ -1,0 +1,5 @@
+Save-Module -Name AWS.Tools.EC2 -Path "C:\github\psmodules"
+Save-Module -Name AWS.Tools.IdentityManagement -Path "C:\github\psmodules"
+Save-Module -Name AWS.Tools.KeyManagementService -Path "C:\github\psmodules"
+Save-Module -Name AWS.Tools.SecurityToken -Path "C:\github\psmodules"
+Save-Module -Name AWS.Tools.Common -Path "C:\github\psmodules"

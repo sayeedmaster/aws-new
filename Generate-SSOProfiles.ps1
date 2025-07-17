@@ -220,19 +220,21 @@ foreach ($acct in $accounts) {
             $cleanRoleName = $role.roleName -replace '[^\w\-]', ''
             $profileName = "$Prefix-$cleanAccountName-$cleanRoleName"
             
+            $profileBlock = @"
+
+[profile $profileName]
+sso_session = $sessionName
+sso_start_url = $baseStartUrl
+sso_region = $baseSsoRegion
+sso_account_id = $($acct.accountId)
+sso_role_name = $($role.roleName)
+region = $baseRegion
+sso_registration_scopes = sso:account:access
+"@
             try {
-                aws configure set sso_start_url  $baseStartUrl      --profile $profileName
-                aws configure set sso_region     $baseSsoRegion     --profile $profileName
-                aws configure set sso_account_id $acct.accountId    --profile $profileName
-                aws configure set sso_role_name  $role.roleName     --profile $profileName
-                aws configure set region         $baseRegion        --profile $profileName
-                
+                Add-Content -Path $configPath -Value $profileBlock
                 Write-Host "   >> created profile [$profileName]" -ForegroundColor Green
                 $totalProfiles++
-                
-                # Add a blank line after each profile (with a small delay to ensure AWS CLI has finished writing)
-                Start-Sleep -Milliseconds 50
-                Add-Content -Path $configPath -Value ""
             } catch {
                 Write-Warning "Failed to create profile [$profileName]: $($_.Exception.Message)"
             }
