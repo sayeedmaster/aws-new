@@ -1,16 +1,8 @@
 {
-  "Monitoring": "true",
   "MetadataOptionsHttpTokens": "required",
   "MetadataOptionsHttpEndpoint": "enabled",
   "MetadataOptionsHttpPutResponseHopLimit": 2,
-  "InstanceMetadataTags": "enabled",
-  "DisableApiTermination": "true",
-  "InstanceInitiatedShutdownBehavior": "stop",
-  "AutoRecovery": "true",
-  "SriovNetSupport": "simple",
-  "EnaSupport": "true",
-  "TrafficMirroring": "false",
-  "CpuCoreCount": 2,
-  "CpuThreadsPerCore": 1,
+  "InstanceMetadataTags": "disabled",
+  "DisableApiTermination": "false",
   "Tags": "Environment=Production,Owner=Cloudwick"
 }

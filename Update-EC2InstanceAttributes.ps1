@@ -24,6 +24,7 @@
     Prerequisites: AWS SSO must be set up in your AWS account
     Dependencies: AWS.Tools.Common, AWS.Tools.EC2, AWS.Tools.SecurityToken, AWS.Tools.CloudWatch, ImportExcel
     Error Handling: The script includes error handling for AWS API calls, file operations, and input validation.
+    Updated to remove dependency on ConvertTo-Hashtable and directly use ConvertFrom-Json output
 .PARAMETERS 
     -PSModulesPath - Path to the directory containing AWS.Tools and ImportExcel modules (mandatory).
     -JsonFilePath - Path to the JSON file containing EC2 attribute key-value pairs (mandatory).
@@ -47,7 +48,7 @@ param (
 
 # Determine the script's root directory for reliable path resolution
 $ScriptPath = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
-$ExcelFilePath = (Join-Path $ScriptPath "EC2_Update.xlsx")
+$ExcelFilePath = (Join-Path $ScriptPath "EC2_Config.xlsx")
 $LogFilePath = (Join-Path $ScriptPath "logs\EC2_Update_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log")
 
 # Function to write logs
@@ -149,7 +150,7 @@ function Test-EC2Permissions {
         $errorCode = $_.Exception.ErrorCode
         Write-Log "Failed to validate permissions for EC2 operations with profile: $ProfileName in region: $Region. ErrorCode: $errorCode, Error: $errorMessage" "ERROR"
         if ($errorMessage -match "AccessDenied|UnauthorizedOperation") {
-            $requiredPermissions = "'ec2:DescribeInstances', 'ec2:ModifyInstanceAttribute', 'ec2:ModifyInstanceMetadataOptions', 'ec2:CreateTags', 'cloudwatch:PutMetricAlarm', 'cloudwatch:DeleteAlarms'"
+            $requiredPermissions = "'ec2:DescribeInstances', 'ec2:ModifyInstanceAttribute', 'ec2:ModifyInstanceMetadataOptions', 'ec2:CreateTags'"
             Write-Log "Insufficient permissions. Ensure the role has $requiredPermissions permissions." "ERROR"
             return $false
         } else {
@@ -191,15 +192,16 @@ function Update-EC2InstanceAttributes {
         [Parameter(Mandatory=$true)]
         [string]$InstanceId,
         [Parameter(Mandatory=$true)]
-        [hashtable]$Attributes,
+        [PSCustomObject]$Attributes,
         [Parameter(Mandatory=$true)]
         [string]$ProfileName,
         [Parameter(Mandatory=$true)]
         [string]$Region
     )
     try {
-        foreach ($key in $Attributes.Keys) {
-            $value = $Attributes[$key]
+        $attributeNames = $Attributes.PSObject.Properties.Name
+        foreach ($key in $attributeNames) {
+            $value = $Attributes.$key
             Write-Log "Updating attribute '$key' to '$value' for instance $InstanceId" "INFO"
             
             if ($DryRun) {
@@ -379,7 +381,6 @@ try {
     }
     try {
         $attributes = Get-Content -Path $JsonFilePath -Raw | ConvertFrom-Json -ErrorAction Stop
-        $attributes = $attributes | ConvertTo-Hashtable
         Write-Log "Successfully read JSON attributes: $(ConvertTo-Json -InputObject $attributes -Depth 3 -Compress)" "DEBUG"
     } catch {
         Write-Log "Failed to parse JSON file: $JsonFilePath. Error: $($_.Exception.Message)" "ERROR"
