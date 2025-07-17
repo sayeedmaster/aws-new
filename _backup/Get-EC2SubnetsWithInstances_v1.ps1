@@ -3,7 +3,7 @@
 # Supports interactive selection of all configured AWS profiles
 # Outputs subnet details and optionally instance details to CSV
 # Uses AWS.Tools.EC2 and AWS.Tools.IdentityManagement cmdlets
-# Includes robust logging, region validation, and improved handling for shared VPCs
+# Includes robust logging, region validation, and error handling
 
 [CmdletBinding()]
 param(
@@ -24,11 +24,9 @@ param(
     [Parameter()]
     [string]$OutputFile,
     [Parameter()]
-    [switch]$IncludeEmptySubnets = $false,
+    [switch]$IncludeEmptySubnets,
     [Parameter()]
-    [bool]$IncludeDefaultVPC = $false,
-    [Parameter()]
-    [bool]$IncludeSharedVPCs = $true,
+    [bool]$IncludeDefaultVPC = $true,
     [Parameter()]
     [int]$MinInstanceCount = 0,
     [Parameter()]
@@ -76,6 +74,7 @@ function Get-ValidAWSRegion {
         Write-Log "Using provided region: $Region" "INFO"
         return $Region
     }
+    # Try to parse region from ~/.aws/config
     try {
         $configPath = Join-Path $env:USERPROFILE ".aws\config"
         if (Test-Path $configPath) {
@@ -92,10 +91,12 @@ function Get-ValidAWSRegion {
     } catch {
         Write-Log "Failed to parse region from config for profile ${ProfileName}: $($_.Exception.Message)" "WARN"
     }
+    # Fall back to environment variable
     if ($env:AWS_DEFAULT_REGION -and $validRegions -contains $env:AWS_DEFAULT_REGION) {
         Write-Log "Using region from AWS_DEFAULT_REGION: $env:AWS_DEFAULT_REGION" "INFO"
         return $env:AWS_DEFAULT_REGION
     }
+    # Fall back to default region
     $defaultRegion = "eu-west-1"
     Write-Log "No valid region found for profile $ProfileName. Using default region: $defaultRegion" "WARN"
     return $defaultRegion
@@ -105,9 +106,12 @@ function Get-ValidAWSRegion {
 function Sanitize-String {
     param([string]$InputString)
     try {
+        # Extract the filename without path
         $fileName = [System.IO.Path]::GetFileName($InputString)
         $directory = [System.IO.Path]::GetDirectoryName($InputString)
+        # Sanitize only the filename
         $sanitizedFileName = $fileName -replace '[^a-zA-Z0-9.]', '_'
+        # Reconstruct the full path
         $sanitized = if ($directory) { Join-Path $directory $sanitizedFileName } else { $sanitizedFileName }
         Write-Log "Sanitized string '$InputString' to '$sanitized' using -replace" "INFO"
         return $sanitized
@@ -123,18 +127,8 @@ function Sanitize-String {
 # Function to get resource name from tags
 function Get-ResourceName {
     param([object]$Resource)
-    try {
-        $nameTag = $Resource.Tags | Where-Object { $_.Key -eq "Name" }
-        if ($nameTag) {
-            return $nameTag.Value
-        } else {
-            Write-Log "No Name tag found for resource $($Resource.PSObject.Properties['VPCId'] ? $Resource.VPCId : $Resource.SubnetId)" "DEBUG"
-            return "N/A"
-        }
-    } catch {
-        Write-Log "Error accessing tags for resource $($Resource.PSObject.Properties['VPCId'] ? $Resource.VPCId : $Resource.SubnetId): $($_.Exception.Message)" "WARN"
-        return "N/A"
-    }
+    $nameTag = $Resource.Tags | Where-Object { $_.Key -eq "Name" }
+    return $nameTag ? $nameTag.Value : "N/A"
 }
 
 # Function to get a specific tag value
@@ -143,29 +137,14 @@ function Get-ResourceTagValue {
         [object]$Resource,
         [string]$TagName
     )
-    try {
-        $tag = $Resource.Tags | Where-Object { $_.Key -eq $TagName }
-        if ($tag) {
-            return $tag.Value
-        } else {
-            Write-Log "No $TagName tag found for resource $($Resource.PSObject.Properties['VPCId'] ? $Resource.VPCId : $Resource.SubnetId)" "DEBUG"
-            return "N/A"
-        }
-    } catch {
-        Write-Log "Error accessing $TagName tag for resource $($Resource.PSObject.Properties['VPCId'] ? $Resource.VPCId : $Resource.SubnetId): $($_.Exception.Message)" "WARN"
-        return "N/A"
-    }
+    $tag = $Resource.Tags | Where-Object { $_.Key -eq $TagName }
+    return $tag ? $tag.Value : "N/A"
 }
 
 # Function to check if VPC is default
 function Test-DefaultVPC {
     param([object]$VPC)
-    try {
-        return $VPC.IsDefault
-    } catch {
-        Write-Log "Error checking IsDefault for VPC $($VPC.VpcId): $($_.Exception.Message)" "WARN"
-        return $false
-    }
+    return $VPC.IsDefault
 }
 
 # Function to determine instance platform
@@ -219,12 +198,8 @@ function Get-AllVPCs {
         Write-Log "Discovering all VPCs in region: $Region for profile: $ProfileName" "INFO"
         $vpcs = Get-EC2Vpc -ProfileName $ProfileName -Region $Region -ErrorAction Stop
         if (-not $IncludeDefaultVPC) {
-            $vpcs = $vpcs | Where-Object { -not (Test-DefaultVPC -VPC $_) }
+            $vpcs = $vpcs | Where-Object { -not $_.IsDefault }
             Write-Log "Excluded default VPC from analysis" "INFO"
-        }
-        if (-not $IncludeSharedVPCs) {
-            $vpcs = $vpcs | Where-Object { $_.PSObject.Properties['OwnerId'] -and $_.OwnerId -eq (Get-STSCallerIdentity -ProfileName $ProfileName -Region $Region).Account }
-            Write-Log "Excluded shared VPCs from analysis" "INFO"
         }
         if ($vpcs.Count -eq 0) {
             Write-Log "No VPCs found matching the criteria" "WARN"
@@ -233,9 +208,8 @@ function Get-AllVPCs {
         Write-Log "Found $($vpcs.Count) VPC(s) to analyze" "INFO"
         foreach ($vpc in $vpcs) {
             $vpcName = Get-ResourceName -Resource $vpc
-            $isDefault = if (Test-DefaultVPC -VPC $vpc) { " (Default)" } else { "" }
-            $isShared = if ($vpc.PSObject.Properties['OwnerId'] -and $vpc.OwnerId -ne (Get-STSCallerIdentity -ProfileName $ProfileName -Region $Region).Account) { " (Shared)" } else { "" }
-            Write-Host "  - $($vpc.VpcId): $vpcName$isDefault$isShared" -ForegroundColor Gray
+            $isDefault = if ($vpc.IsDefault) { " (Default)" } else { "" }
+            Write-Host "  - $($vpc.VpcId): $vpcName$isDefault" -ForegroundColor Gray
         }
         return $vpcs
     } catch {
@@ -254,7 +228,6 @@ function Get-AllSubnetUtilization {
         [string]$AccountId
     )
     $results = @()
-    $subnetIdsProcessed = @{} # Track processed subnets to avoid duplicates
     $totalVPCs = $VPCs.Count
     $currentVPC = 0
     $totalSubnetsAnalyzed = 0
@@ -264,14 +237,14 @@ function Get-AllSubnetUtilization {
         $currentVPC++
         $vpcName = Get-ResourceName -Resource $vpc
         $vpcIpfEnvironment = Get-ResourceTagValue -Resource $vpc -TagName "ipf:environment"
-        $isDefault = Test-DefaultVPC -VPC $vpc
-        $vpcOwnerId = if ($vpc.PSObject.Properties['OwnerId']) { $vpc.OwnerId } else { $AccountId }
-        $isShared = $vpcOwnerId -ne $AccountId
-        $ownerAccountName = if ($isShared) { "SharedVPC-$vpcOwnerId" } else { $AccountName }
-        $isDefaultStr = if ($isDefault) { " (Default)" } else { "" }
-        $isSharedStr = if ($isShared) { " (Shared, Owner: $vpcOwnerId)" } else { "" }
-        Write-Progress -Activity "Analyzing VPCs" -Status "Processing VPC $($vpc.VpcId)$isDefaultStr$isSharedStr ($currentVPC of $totalVPCs)" -PercentComplete (($currentVPC / $totalVPCs) * 100)
-        Write-Log "Analyzing VPC: $($vpc.VpcId) ($vpcName)$isDefaultStr$isSharedStr" "INFO"
+        $isDefault = if ($vpc.IsDefault) { " (Default)" } else { "" }
+        # Determine if VPC is shared (ownerId != current accountId)
+        $vpcIsShared = $false
+        if ($vpc.PSObject.Properties['OwnerId'] -and $vpc.OwnerId -ne $AccountId) {
+            $vpcIsShared = $true
+        }
+        Write-Progress -Activity "Analyzing VPCs" -Status "Processing VPC $($vpc.VpcId)$isDefault ($currentVPC of $totalVPCs)" -PercentComplete (($currentVPC / $totalVPCs) * 100)
+        Write-Log "Analyzing VPC: $($vpc.VpcId) ($vpcName)$isDefault" "INFO"
 
         try {
             $subnets = Get-EC2Subnet -Filter @{ Name = "vpc-id"; Values = $vpc.VpcId } -ProfileName $ProfileName -Region $Region -ErrorAction Stop
@@ -279,12 +252,6 @@ function Get-AllSubnetUtilization {
             $totalSubnetsAnalyzed += $subnets.Count
 
             foreach ($subnet in $subnets) {
-                if ($subnetIdsProcessed.ContainsKey($subnet.SubnetId)) {
-                    Write-Log "Subnet $($subnet.SubnetId) already processed in this VPC. Skipping to avoid duplication." "DEBUG"
-                    continue
-                }
-                $subnetIdsProcessed[$subnet.SubnetId] = $true
-
                 $subnetName = Get-ResourceName -Resource $subnet
                 $filters = @(
                     @{ Name = "subnet-id"; Values = $subnet.SubnetId }
@@ -308,11 +275,10 @@ function Get-AllSubnetUtilization {
                         AccountName = $AccountName
                         AccountId = $AccountId
                         VPCId = $vpc.VpcId
-                        VPCName = if ($vpcName -eq "N/A" -and $isShared) { "SharedVPC-$($vpc.VpcId)" } else { $vpcName }
+                        VPCName = $vpcName
                         VPCIpfEnvironment = $vpcIpfEnvironment
-                        VPCIsDefault = $isDefault
-                        VPCIsShared = $isShared
-                        VPCOwnerId = $vpcOwnerId
+                        VPCIsDefault = $vpc.IsDefault
+                        VPCIsShared = $vpcIsShared
                         SubnetId = $subnet.SubnetId
                         SubnetName = $subnetName
                         AvailabilityZone = $subnet.AvailabilityZone
@@ -390,24 +356,23 @@ function Show-Results {
             VPCName = ($_.Group | Select-Object -First 1).VPCName
             IsDefault = ($_.Group | Select-Object -First 1).VPCIsDefault
             IsShared = ($_.Group | Select-Object -First 1).VPCIsShared
-            VPCOwnerId = ($_.Group | Select-Object -First 1).VPCOwnerId
             SubnetCount = $_.Count
             TotalInstances = ($_.Group | Measure-Object -Property InstanceCount -Sum).Sum
         }
     }
 
     Write-Host "`nDetailed Summary:" -ForegroundColor Cyan
-    Write-Host "- Total VPCs with matching subnets: $($vpcStats.Count)"
+    Write-Host "- Total VPCs with matching subnets: $(($Results | Select-Object -Unique VPCId).Count)"
     Write-Host "- Total subnets with instances: $(($Results | Where-Object { $_.InstanceCount -gt 0 }).Count)"
     Write-Host "- Total subnets found: $($Results.Count)"
     Write-Host "- Total instances: $(($Results | Measure-Object -Property InstanceCount -Sum).Sum)"
     Write-Host "- Public subnets: $(($Results | Where-Object { $_.SubnetType -eq 'Public' }).Count)"
     Write-Host "- Private subnets: $(($Results | Where-Object { $_.SubnetType -eq 'Private' }).Count)"
-    Write-Host "- Shared VPCs: $(($vpcStats | Where-Object { $_.IsShared }).Count)"
     if ($vpcStats | Where-Object { $_.IsDefault }) { Write-Host "- Default VPC included: Yes" -ForegroundColor Gray }
 
     Write-Host "`nVPC Breakdown:" -ForegroundColor Cyan
-    $vpcStats | Format-Table -Property VPCId, VPCName, IsDefault, IsShared, VPCOwnerId, SubnetCount, TotalInstances -AutoSize
+    $vpcStats | Format-Table -Property VPCId, VPCName, IsDefault, IsShared, SubnetCount, TotalInstances -AutoSize
+
 
     if ($OutputFormat -eq "CSV") {
         $flatResults = @()
@@ -422,7 +387,6 @@ function Show-Results {
                         VPCIpfEnvironment = $result.VPCIpfEnvironment
                         VPCIsDefault = $result.VPCIsDefault
                         VPCIsShared = $result.VPCIsShared
-                        VPCOwnerId = $result.VPCOwnerId
                         SubnetId = $result.SubnetId
                         SubnetName = $result.SubnetName
                         SubnetType = $result.SubnetType
@@ -449,7 +413,6 @@ function Show-Results {
                     VPCIpfEnvironment = $result.VPCIpfEnvironment
                     VPCIsDefault = $result.VPCIsDefault
                     VPCIsShared = $result.VPCIsShared
-                    VPCOwnerId = $result.VPCOwnerId
                     SubnetId = $result.SubnetId
                     SubnetName = $result.SubnetName
                     SubnetType = $result.SubnetType
@@ -472,11 +435,11 @@ function Show-Results {
         try {
             $flatResults | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
             Write-Host "Results exported to: $OutputFile" -ForegroundColor Green
-            $columnsToShow = @('AccountName', 'VPCId', 'VPCName', 'VPCIpfEnvironment', 'VPCIsShared', 'VPCOwnerId', 'SubnetId', 'SubnetName', 'InstanceCount')
+            # Display deduplicated subnet summary in console
+            $columnsToShow = @('AccountName', 'VPCId', 'VPCName', 'VPCIpfEnvironment', 'SubnetId', 'SubnetName', 'InstanceCount', 'VPCIsShared')
             $dedupedResults = $flatResults | Group-Object SubnetId | ForEach-Object {
                 $_.Group | Select-Object -First 1 | Select-Object $columnsToShow
             }
-            Write-Host "`nSubnet Summary:" -ForegroundColor Cyan
             $dedupedResults | Format-Table -Property $columnsToShow -AutoSize
             if ($flatResults.Count -gt $dedupedResults.Count) {
                 Write-Host "Displayed deduplicated subnet summary. See CSV file for instance details." -ForegroundColor Gray
@@ -599,23 +562,14 @@ try {
     # Test profile connectivity
     if ($TestProfilesFirst -and $AwsProfiles) {
         Write-Host "`nTesting AWS profile connectivity..." -ForegroundColor Cyan
-        $validProfiles = @()
         foreach ($profile in $AwsProfiles) {
             $currentRegion = Get-ValidAWSRegion -Region $Region -ProfileName $profile
             if (-not $currentRegion) {
                 Write-Log "Skipping profile $profile due to invalid region" "ERROR"
                 continue
             }
-            if (Test-AwsProfileConnectivity -ProfileName $profile -Region $currentRegion) {
-                $validProfiles += $profile
-            }
+            Test-AwsProfileConnectivity -ProfileName $profile -Region $currentRegion
         }
-        if ($validProfiles.Count -eq 0) {
-            Write-Log "No valid profiles found after connectivity tests. Please check your AWS configuration." "ERROR"
-            exit 1
-        }
-        $AwsProfiles = $validProfiles
-        Write-Log "Proceeding with $($validProfiles.Count) valid profiles" "INFO"
     }
 
     # Main execution
@@ -691,7 +645,6 @@ try {
     Write-Host "Include Instance Details: $IncludeInstanceDetails" -ForegroundColor Gray
     Write-Host "Include Empty Subnets: $IncludeEmptySubnets" -ForegroundColor Gray
     Write-Host "Include Default VPC: $IncludeDefaultVPC" -ForegroundColor Gray
-    Write-Host "Include Shared VPCs: $IncludeSharedVPCs" -ForegroundColor Gray
     Write-Host "Minimum Instance Count: $MinInstanceCount" -ForegroundColor Gray
     Write-Host ""
 
@@ -711,8 +664,7 @@ try {
         Join-Path $OutputDir "subnet_utilization_summary_${timestamp}.csv"
     }
     try {
-        $allResults | Select-Object AccountName, AccountId, VPCId, VPCName, VPCIpfEnvironment, VPCIsDefault, VPCIsShared, VPCOwnerId, SubnetId, SubnetName, InstanceCount, AvailabilityZone, CidrBlock |
-            Export-Csv -Path $summaryCsvFile -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+        $allResults | Select-Object VPCId, VPCName, SubnetName, SubnetId, InstanceCount | Export-Csv -Path $summaryCsvFile -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
         Write-Host "Subnet summary exported to: $summaryCsvFile" -ForegroundColor Green
     } catch {
         Write-Log "Failed to export subnet summary CSV: $($_.Exception.Message)" "ERROR"
@@ -725,7 +677,6 @@ try {
     Write-Log "Total subnets found: $($allResults.Count)" "INFO"
     Write-Log "Total instances: $(($allResults | Measure-Object -Property InstanceCount -Sum).Sum)" "INFO"
     Write-Log "Output file: $OutputFile" "INFO"
-    Write-Log "Summary file: $summaryCsvFile" "INFO"
     Write-Log "Script completed successfully!" "INFO"
 
 } catch {
