@@ -7,8 +7,8 @@
 
 [CmdletBinding()]
 param(
-    [Parameter()]
-    [string]$PSModulesPath = "D:\SidM\psmodules",
+    [Parameter(Mandatory=$true, HelpMessage="Path to the directory containing AWS.Tools modules.")]
+    [string]$PSModulesPath,
     [Parameter()]
     [string]$Region,
     [Parameter()]
