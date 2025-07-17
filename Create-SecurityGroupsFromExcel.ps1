@@ -1,24 +1,62 @@
-# Create-SecurityGroupsFromExcel.ps1
-# PowerShell script to create and manage AWS security groups and rules from Excel configuration using AWS.Tools modules with multiple SSO profiles
-# Supports dry run mode to simulate actions without modifying AWS resources
-# Supports -ReplaceSG switch to delete and recreate existing security groups before adding rules
-# Supports -SkipPermissionValidation switch to bypass permission checks for administrator roles
-# Skips adding egress rule (all -1 -1 0.0.0.0/0) if it already exists as the default egress rule
-# Uses -IpPermission (singular) for Grant-EC2SecurityGroupIngress/Egress to match module compatibility
-# Fixed CIDR validation in Test-CidrBlock to correctly handle valid network addresses like 10.0.0.0/16
-# Enhanced debugging to log module version, IpPermission object, raw security group response, and equivalent direct command
-# Updated to check for existing rules using Ipv4Ranges instead of IpRanges, supporting Ipv6Ranges and PrefixListIds, ignoring Description for uniqueness
-# Uses -GroupId for rule addition, with robust retrieval for new and existing groups
-# Retains 2-second sleep after creating new security groups to allow propagation
-# Fixed permission validation to use valid MaxResults value and improved error handling
-# Fixed GroupId handling for New-EC2SecurityGroup string response and improved retry logic for duplicate group errors
-# Updated ec2:DeleteSecurityGroup permission check to use a randomized valid group ID and handle unexpected errors as warnings
-# Enhanced rule addition loop to log detailed errors and continue processing all rules
-# Added final verification step to confirm applied rules
-# Enhanced Excel handling: module version check, dual-strategy reading (headers then -NoHeader), header validation, placeholder row filtering, and detailed error handling
-# Supports prefix list rules (Source starting with 'pl-') with validation and rule addition via AWS CLI to avoid PrefixListId property errors
-# Added breakdown of CIDR-based, prefix list-based, and security group-based rules in the log message for valid configurations
-# Added functionality to write SecurityGroupIds back to Excel in the SecurityGroupIds column for each processed group
+<#
+.SYNOPSIS
+    Creates and manages AWS security groups and rules from Excel configuration.
+
+.DESCRIPTION
+    This script reads security group configurations from an Excel file, performs preflight checks, and creates security groups and rules using AWS.Tools modules.
+    It supports multiple SSO profiles and allows dry run mode to simulate actions without modifying AWS resources or the Excel file.
+    The script also writes the created security group's ID back to the Excel file.
+    It performs various preflight checks including:
+    - Validating security group name uniqueness in the specified VPC
+    - Checking for existing security groups and creating new ones if necessary
+    - Validating CIDR blocks, prefix lists, and security group IDs
+    - Ensuring required permissions are available for security group operations
+    - Handling both ingress and egress rules
+    - Logging actions and errors to a specified log file
+    - The script can delete and recreate existing security groups before adding rules if the -ReplaceSG switch is used.
+    - It also supports skipping permission validation for accounts with full administrator access using the -SkipPermissionValidation switch.
+    - The script can be run in dry run mode using the -DryRun switch, which simulates actions without modifying AWS resources or the Excel file.
+    
+.NOTES
+    Author: Sayeed Master
+    Date: July 17, 2025
+    Version: 5.0.0
+    License: MIT
+    Usage: .\Create-SecurityGroupsFromExcel.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' [-ExcelFilePath 'C:\Path\To\EC2_Config.xlsx'] [-LogFilePath 'C:\Path\To\Logs\EC2_Launch_Log.log'] [-DryRun]
+    Requrements: AWS.Tools modules installed in the specified PSModulesPath
+    Requirements: ImportExcel module installed in the specified PSModulesPath
+    Prerequisites: AWS SSO must be set up in your AWS account
+    Prerequisites: AWS CLI must be installed and configured in your environment for prefix list rules.
+    Prerequisites: Ensure the AWS.Tools and ImportExcel modules are available in the specified PSModulesPath.
+    Prerequisites: Ensure the AWS CLI is installed and available in your PATH for prefix list rules.
+    Prerequisites: Ensure the AWS config file exists at $env:USERPROFILE\.aws\config with the required SSO profile configuration.
+
+.PARAMETERS 
+    PSModulesPath
+        Path to the directory containing AWS.Tools and ImportExcel modules.
+        This is a mandatory parameter.
+
+    DryRun
+        Run in dry run mode to simulate actions without modifying AWS resources or the Excel file.
+        This is an optional switch.
+
+    ReplaceSG
+        Delete and recreate existing security groups before adding rules.
+        This is an optional switch.
+
+    SkipPermissionValidation
+        Skip permission validation for accounts with full administrator access.
+        This is an optional switch.
+
+    ScriptDebug
+        Show debug messages in output.
+        This is an optional boolean parameter, default is $false.
+
+.EXAMPLE
+    .\Create-SecurityGroupsFromExcel.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' -ExcelFilePath 'C:\Path\To\EC2_Config.xlsx' -LogFilePath 'C:\Path\To\Logs\EC2_Launch_Log.log' -DryRun
+#>
+
+
 
 param (
     [Parameter(Mandatory=$true, HelpMessage="Path to the directory containing AWS.Tools and ImportExcel modules.")]

@@ -1,8 +1,39 @@
-# Launch-EC2FromExcel.ps1
-# PowerShell script to launch EC2 instances from Excel configuration using AWS.Tools modules with multiple SSO profiles
-# and write the InstanceId back to the InstanceId field in the Excel file
-# Supports dry run mode to simulate actions without modifying AWS resources or the Excel file
-# Added preflight check to ensure no EC2 instance with the same InstanceName exists in the same VPC in a running state
+<#
+.SYNOPSIS
+    Launches EC2 instances based on configurations specified in an Excel file.
+
+.DESCRIPTION
+    This script reads EC2 instance configurations from an Excel file, performs preflight checks, and launches instances using AWS.Tools modules.
+    It supports multiple SSO profiles and allows dry run mode to simulate actions without modifying AWS resources or the Excel file.
+    The script also writes the launched instance's InstanceId back to the Excel file.
+    It performs various preflight checks including:
+    - Validating instance name uniqueness in the specified VPC  
+    - Checking for existing key pairs and creating new ones if necessary
+    - Validating subnet and IP address availability
+    - Validating security groups, IAM instance profiles, and AMIs   
+    - Validating instance types against a list of valid types
+    - Checking SR-IOV compatibility for instance types
+    - Validating root volume configuration and encryption settings
+    - Ensuring the SSO session is valid and prompting for login if needed
+    
+.NOTES
+    Author: Sayeed Master
+    Date: July 17, 2025
+    Version: 5.0.0
+    License: MIT
+    Usage: .\Launch-EC2FromExcel.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' [-ExcelFilePath 'C:\Path\To\EC2_Config.xlsx'] [-LogFilePath 'C:\Path\To\Logs\EC2_Launch_Log.log'] [-DryRun]
+    Requrements: AWS.Tools modules installed in the specified PSModulesPath
+    Requirements: ImportExcel module installed in the specified PSModulesPath
+    Prerequisites: AWS SSO must be set up in your AWS account
+.PARAMETERS 
+    -PSModulesPath - Path to the directory containing AWS.Tools and ImportExcel modules (mandatory).
+    -ExcelFilePath - Path to the Excel file containing EC2 configurations (optional, default: 'EC2_Config.xlsx' in script directory).
+    -LogFilePath - Path to the log file where script actions will be recorded (optional, default: 'logs\EC2_Launch_Log_YYYYMMDD_HHMMSS.log' in script directory).
+    -DryRun - Switch to run the script in dry run mode, simulating actions without modifying AWS resources or the Excel file (optional).
+
+.EXAMPLE
+    .\Launch-EC2FromExcel.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' -ExcelFilePath 'C:\Path\To\EC2_Config.xlsx' -LogFilePath 'C:\Path\To\Logs\EC2_Launch_Log.log' -DryRun
+#>
 
 param (
     [Parameter(Mandatory=$true, HelpMessage="Path to the directory containing AWS.Tools and ImportExcel modules.")]

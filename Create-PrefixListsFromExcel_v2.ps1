@@ -1,12 +1,56 @@
-# Create-PrefixListsFromExcel.ps1
-# PowerShell script to create managed prefix lists in specified VPCs from Excel configuration
-# using AWS.Tools modules with multiple SSO profiles and write the PrefixListId back to the Excel file
-# Supports dry run mode to simulate actions without modifying AWS resources or the Excel file
-# Groups rows by PrefixListName, with each row specifying a single CIDR and its description
-# Handles updated column headers (CIDRDescription, Tags) and applies tags to prefix lists
-# Skips creation if prefix list already exists (based on PrefixListId or PrefixListName)
-# Enhanced Excel handling: module version check, dual-strategy reading (headers then -NoHeader), 
-# header validation, placeholder row filtering, and detailed error handling
+<#
+.SYNOPSIS
+    Creates and manages AWS prefix lists from Excel configuration.
+
+.DESCRIPTION
+    This script reads prefix list configurations from an Excel file, performs preflight checks, and creates prefix lists using AWS.Tools modules.
+    It supports multiple SSO profiles and allows dry run mode to simulate actions without modifying AWS resources or the Excel file.
+    The script also writes the created prefix list's ID back to the Excel file.
+    It performs various preflight checks including:
+    - Validating prefix list name uniqueness in the specified VPC
+    - Checking for existing prefix lists and creating new ones if necessary
+    - Logging actions and errors to a specified log file
+    - It also supports skipping permission validation for accounts with full administrator access using the -SkipPermissionValidation switch.
+    - The script can be run in dry run mode using the -DryRun switch, which simulates actions without modifying AWS resources or the Excel file.
+    
+.NOTES
+    Author: Sayeed Master
+    Date: July 17, 2025
+    Version: 2.0.0
+    License: MIT
+    Usage: .\Create-PrefixListsFromExcel.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' -DryRun -LogFilePath 'C:\Path\To\Logs\PrefixList_Create_Log.log'
+    Requrements: AWS.Tools modules installed in the specified PSModulesPath
+    Requirements: ImportExcel module installed in the specified PSModulesPath
+    Prerequisites: AWS SSO must be set up in your AWS account
+    Prerequisites: AWS CLI must be installed and configured in your environment for prefix list rules.
+    Prerequisites: Ensure the AWS.Tools and ImportExcel modules are available in the specified PSModulesPath.
+    Prerequisites: Ensure the AWS CLI is installed and available in your PATH for prefix list rules.
+    Prerequisites: Ensure the AWS config file exists at $env:USERPROFILE\.aws\config with the required SSO profile configuration.
+
+.PARAMETERS 
+    PSModulesPath
+        Path to the directory containing AWS.Tools and ImportExcel modules.
+        Default: Current script directory.
+
+    ExcelFilePath
+        Path to the Excel file containing prefix list configurations.
+        Default: "EC2_Config.xlsx" in the current script directory.
+
+    LogFilePath
+        Path to the log file where script actions and errors will be recorded.
+        Default: "logs\PrefixList_Create_Log_YYYYMMDD_HHMMSS.log" in the current script directory.
+
+    DryRun
+        Run in dry run mode to simulate actions without modifying AWS resources or the Excel file.
+        Default: False.
+
+    ScriptDebug
+        Show debug messages in output.
+        Default: False.
+        Use -ScriptDebug to enable debug messages for detailed logging.
+.EXAMPLE
+    .\Create-PrefixListsFromExcel.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' -ExcelFilePath 'C:\Path\To\EC2_Config.xlsx' -LogFilePath 'C:\Path\To\Logs\EC2_Launch_Log.log' -DryRun
+#>
 
 param (
     [Parameter(Mandatory=$true, HelpMessage="Path to the directory containing AWS.Tools and ImportExcel modules.")]

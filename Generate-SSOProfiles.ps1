@@ -9,27 +9,20 @@
     This script uses 'aws configure sso' to set up SSO authentication interactively.
     You will be prompted to enter your SSO start URL, region, and other configuration.
     After successful authentication, it automatically creates profiles for all accounts and roles.
-
-.DESIGNED FOR
-    Windows PowerShell 5.1  (no extra modules needed)
-
-.PARAMETERS
-    -Prefix         Text to prepend to every generated profile name (default: 'sso')
     
 .NOTES
-    The script will prompt you interactively for:
+    Author: Sayeed Master
+    Date: July 17, 2025
+    Version: 2.0.0
+    License: MIT
+    Usage: .\Generate-SSOProfiles.ps1 -Prefix 'sso'
+    Requirements: AWS CLI v2 installed and configured
+    Prerequisites: AWS SSO must be set up in your AWS account
+
+    - The script will prompt you interactively for:
     - SSO start URL (e.g., https://ipfeu.awsapps.com/start)
-    - SSO start URL (e.g., https://cloudwick-aws.awsapps.com/start
     - SSO region (e.g., eu-west-1)
     - Default region for all profiles (e.g., eu-west-1)
-    
-    Version: 2.0
-    Changes from v1:
-    - Fixed SSO authentication issue by using 'aws configure sso' instead of manual profile setup
-    - Interactive configuration prompts for all SSO settings
-    - Dynamic configuration reading from the base profile
-    - Improved error handling and validation
-    - Better user experience with clearer feedback
 #>
 
 param(
@@ -75,7 +68,7 @@ Write-Host "Setting up base SSO profile [$base]..." -ForegroundColor Yellow
 # ----------------------------  3. SSO Configuration & Authentication  ------
 Write-Host "`nStarting interactive SSO configuration..." -ForegroundColor Cyan
 Write-Host "You will be prompted for the following:" -ForegroundColor White
-Write-Host "  1. SSO start URL (e.g., https://ipfeu.awsapps.com/start)" -ForegroundColor Gray
+Write-Host "  1. SSO start URL (e.g., https://ipfeu.awsapps.com/start, https://cloudwick-aws.awsapps.com/start)" -ForegroundColor Gray
 Write-Host "  2. SSO region (e.g., eu-west-1)" -ForegroundColor Gray
 Write-Host "  3. Account selection" -ForegroundColor Gray
 Write-Host "  4. Role selection" -ForegroundColor Gray
