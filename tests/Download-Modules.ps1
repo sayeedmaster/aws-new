@@ -1,7 +1,0 @@
-Save-Module -Name AWS.Tools.EC2 -Path "C:\Development\binaries\psmodules"
-Save-Module -Name AWS.Tools.IdentityManagement -Path "C:\Development\binaries\psmodules"
-Save-Module -Name AWS.Tools.KeyManagementService -Path "C:\Development\binaries\psmodules"
-Save-Module -Name AWS.Tools.SecurityToken -Path "C:\Development\binaries\psmodules"
-Save-Module -Name AWS.Tools.Common -Path "C:\Development\binaries\psmodules"
-Save-Module -Name AWS.Tools.CloudWatch -Path "C:\Development\binaries\psmodules"
-Save-Module -Name ImportExcel -Path "C:\Development\binaries\psmodules"
