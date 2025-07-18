@@ -1,15 +1,9 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$SourceFile,
-
-    [Parameter(Mandatory = $true)]
-    [string]$BucketName,
+    [Parameter(Mandatory = $false)]
+    [string]$TableName = "terraform-state-lock",
 
     [Parameter(Mandatory = $false)]
-    [string]$ProfileName,
-
-    [Parameter(Mandatory = $false)]
-    [string]$Prefix = "artifacts/",  # S3 key prefix (folder)
+    [string]$ProfileName = "sso-production-AdministratorAccess",
 
     [Parameter(Mandatory = $false)]
     [string]$PSModulesPath = "C:\github\psmodules"
@@ -18,14 +12,14 @@ param(
 # Import AWS.Tools modules
 try {
     Import-Module -Name (Join-Path $PSModulesPath "AWS.Tools.Common") -ErrorAction Stop
-    Import-Module -Name (Join-Path $PSModulesPath "AWS.Tools.S3") -ErrorAction Stop
-    Write-Host "✅ Successfully imported AWS.Tools modules (Common, S3)" -ForegroundColor Green
+    Import-Module -Name (Join-Path $PSModulesPath "AWS.Tools.DynamoDBv2") -ErrorAction Stop
+    Write-Host "✅ Successfully imported AWS.Tools modules (Common, DynamoDBv2)" -ForegroundColor Green
 } catch {
-    Write-Host "❌ Failed to import AWS modules from $PSModulesPath. Error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "❌ Failed to import modules from $PSModulesPath. Error: $($_.Exception.Message)" -ForegroundColor Red
     exit 1
 }
 
-# Region helper function
+# Function to derive region
 function Get-ValidAWSRegion {
     param([string]$ProfileName)
     $validRegions = @(
@@ -64,27 +58,23 @@ $Region = Get-ValidAWSRegion -ProfileName $ProfileName
 Write-Host "Using AWS profile: $ProfileName" -ForegroundColor Cyan
 Write-Host "Using AWS region: $Region" -ForegroundColor Cyan
 
-# Validate local file
-if (-not (Test-Path $SourceFile -PathType Leaf)) {
-    Write-Host "❌ Source file '$SourceFile' does not exist or is a directory." -ForegroundColor Red
-    exit 1
-}
-
-# Upload file
-$fileInfo = Get-Item $SourceFile
-$s3Key = if ($Prefix) { "$Prefix$($fileInfo.Name)" } else { $fileInfo.Name }
-
+# Step 1: Check if the table exists
 try {
-    Write-S3Object -BucketName $BucketName `
-                   -File $fileInfo.FullName `
-                   -Key $s3Key `
-                   -Region $Region `
-                   -ProfileName $ProfileName `
-                   -CannedACL "bucket-owner-full-control" | Out-Null
-
-    Write-Host "📦 Uploaded: $($fileInfo.Name) -> s3://$BucketName/$s3Key" -ForegroundColor Green
+    Get-DDBTable -TableName $TableName -ProfileName $ProfileName -Region $Region -ErrorAction Stop
+    Write-Host "⚠️ DynamoDB table '$TableName' already exists in region $Region." -ForegroundColor Yellow
+    return
 } catch {
-    Write-Host "❌ Failed to upload $($fileInfo.Name). Error: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "DynamoDB table does not exist. Proceeding to create..." -ForegroundColor Green
 }
 
-Write-Host "Upload complete." -ForegroundColor Cyan
+# Step 2: Create the DynamoDB table for Terraform state locking
+try {
+    $schema = New-DDBTableSchema
+    $schema | Add-DDBKeySchema -KeyName "LockID" -KeyDataType "S" | New-DDBTable -TableName $TableName -BillingMode PAY_PER_REQUEST -ProfileName $ProfileName -Region $Region
+
+    Write-Host "✅ Successfully created DynamoDB table '$TableName' for Terraform state locking." -ForegroundColor Green
+} catch {
+    Write-Host "❌ Failed to create DynamoDB table. Error: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+Write-Host "`n🎉 Done! DynamoDB table '$TableName' is ready for use with Terraform."

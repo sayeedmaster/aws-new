@@ -1,15 +1,15 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$BucketName,
+    [Parameter(Mandatory = $false)]
+    [string]$BucketName = "userdata-terraform-packages",
 
     [Parameter(Mandatory = $false)]
-    [string]$ProfileName,
+    [string]$ProfileName = "sso-production-AdministratorAccess",
 
     [Parameter(Mandatory = $false)]
-    [string]$PSModulesPath = "C:\Development\binaries\psmodules",
+    [string]$PSModulesPath = "C:\github\psmodules",
 
     [Parameter(Mandatory = $false)]
-    [switch]$EnableVersioning = $false,
+    [switch]$EnableVersioning = $true,
 
     [Parameter(Mandatory = $false)]
     [switch]$BlockPublicAccess = $true
@@ -65,12 +65,13 @@ Write-Host "Using AWS profile: $ProfileName" -ForegroundColor Cyan
 Write-Host "Using AWS region: $Region" -ForegroundColor Cyan
 
 # Step 1: Check if the bucket exists
-try {
-    $bucketExists = Get-S3Bucket -BucketName $BucketName -ProfileName $ProfileName -Region $Region -ErrorAction Stop
+$bucketExists = Get-S3Bucket -BucketName $BucketName -ProfileName $ProfileName -Region $Region -ErrorAction SilentlyContinue
+if ($null -ne $bucketExists) {
     Write-Host "⚠️ Bucket '$BucketName' already exists in region $Region." -ForegroundColor Yellow
     return
-} catch {
-    Write-Host "Bucket does not exist. Proceeding to create..." -ForegroundColor Green
+}
+else {
+    Write-Host "Bucket '$BucketName' does not exist. Proceeding to create..." -ForegroundColor Green
 }
 
 # Step 2: Create the S3 bucket
@@ -83,25 +84,74 @@ if ($EnableVersioning) {
     Write-Host "🗂️ Versioning enabled for bucket: $BucketName" -ForegroundColor Gray
 }
 
-# Step 4: Block public access (recommended)
+# Step 4: Apply server-side encryption
+try {
+    $encryptionRule = New-Object Amazon.S3.Model.ServerSideEncryptionRule
+    $encryptionRule.ServerSideEncryptionByDefault = New-Object Amazon.S3.Model.ServerSideEncryptionByDefault
+    $encryptionRule.ServerSideEncryptionByDefault.ServerSideEncryptionAlgorithm = "AES256"
+    Set-S3BucketEncryption -BucketName $BucketName -ServerSideEncryptionConfiguration_ServerSideEncryptionRule $encryptionRule -ProfileName $ProfileName -Region $Region
+    Write-Host "🔑 Server-side encryption (AES256) enabled for bucket: $BucketName" -ForegroundColor Gray
+} catch {
+    Write-Host "❌ Failed to apply server-side encryption. Error: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+# Step 5: Block public access (recommended)
 if ($BlockPublicAccess) {
-    Write-S3PublicAccessBlock -BucketName $BucketName `
-        -BlockPublicAcls $true `
-        -IgnorePublicAcls $true `
-        -BlockPublicPolicy $true `
-        -RestrictPublicBuckets $true `
+    Add-S3PublicAccessBlock -BucketName $BucketName `
+        -PublicAccessBlockConfiguration_BlockPublicAcl $true `
+        -PublicAccessBlockConfiguration_IgnorePublicAcl $true `
+        -PublicAccessBlockConfiguration_BlockPublicPolicy $true `
+        -PublicAccessBlockConfiguration_RestrictPublicBucket $true `
         -ProfileName $ProfileName `
         -Region $Region
     Write-Host "🔐 Public access blocked for bucket: $BucketName" -ForegroundColor Gray
 }
 
-# Step 5: Add optional tags (optional)
+# Step 6: Add optional tags (optional)
 $tags = @(
     @{ Key = "Environment"; Value = "Lab" },
-    @{ Key = "Purpose"; Value = "UserDataPackages" },
+    @{ Key = "Purpose"; Value = "Terraform State and Artifacts" },
     @{ Key = "Owner"; Value = "$env:USERNAME" }
 )
 Write-S3BucketTagging -BucketName $BucketName -TagSet $tags -ProfileName $ProfileName -Region $Region
 Write-Host "🏷️ Tags applied to bucket." -ForegroundColor Gray
 
-Write-Host "`n🎉 Done! Bucket '$BucketName' is ready for storing software packages and related scripts."
+# Step 7: Apply lifecycle rules
+try {
+    $rule1 = New-Object Amazon.S3.Model.LifecycleRule
+    $rule1.ID = "TerraformStateRetention"
+    $rule1.Filter = New-Object Amazon.S3.Model.LifecycleFilter
+    $rule1.Filter.LifecycleFilterPredicate = New-Object Amazon.S3.Model.LifecyclePrefixPredicate
+    $rule1.Filter.LifecycleFilterPredicate.Prefix = "terraform/"
+    $rule1.Status = "Enabled"
+    $rule1.NoncurrentVersionExpiration = New-Object Amazon.S3.Model.LifecycleRuleNoncurrentVersionExpiration
+    $rule1.NoncurrentVersionExpiration.NoncurrentDays = 3
+
+    $rule2 = New-Object Amazon.S3.Model.LifecycleRule
+    $rule2.ID = "ArtifactsLifecycle"
+    $rule2.Filter = New-Object Amazon.S3.Model.LifecycleFilter
+    $rule2.Filter.LifecycleFilterPredicate = New-Object Amazon.S3.Model.LifecyclePrefixPredicate
+    $rule2.Filter.LifecycleFilterPredicate.Prefix = "artifacts/"
+    $rule2.Status = "Enabled"
+    $rule2.Transitions = New-Object 'System.Collections.Generic.List[Amazon.S3.Model.LifecycleTransition]'
+    $transition = New-Object Amazon.S3.Model.LifecycleTransition
+    $transition.Days = 30
+    $transition.StorageClass = "STANDARD_IA"
+    $rule2.Transitions.Add($transition)
+    $rule2.Expiration = New-Object Amazon.S3.Model.LifecycleRuleExpiration
+    $rule2.Expiration.Days = 31
+    $rule2.AbortIncompleteMultipartUpload = New-Object Amazon.S3.Model.LifecycleRuleAbortIncompleteMultipartUpload
+    $rule2.AbortIncompleteMultipartUpload.DaysAfterInitiation = 7
+
+    Write-Host "--- DEBUG: Rule 1 ---"
+    Write-Host ($rule1 | Out-String)
+    Write-Host "--- DEBUG: Rule 2 ---"
+    Write-Host ($rule2 | Out-String)
+
+    Write-S3LifecycleConfiguration -BucketName $BucketName -Configuration_Rule $rule1, $rule2 -ProfileName $ProfileName -Region $Region
+    Write-Host "🔄 Lifecycle rules applied to bucket." -ForegroundColor Gray
+} catch {
+    Write-Host "❌ Failed to apply lifecycle rules. Error: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+Write-Host "`n🎉 Done! Bucket '$BucketName' is ready for storing Terraform state and artifacts."

@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$RoleName = "EC2-UserDataExecutionRole",
     [Parameter(Mandatory = $false)]
-    [string]$PSModulesPath = "C:\Development\binaries\psmodules"
+    [string]$PSModulesPath = "C:\github\psmodules"
 )
 
 $PolicyName      = "$RoleName-Policy"
