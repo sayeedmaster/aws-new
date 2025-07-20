@@ -1,0 +1,28 @@
+{
+  "Domain": "cloudwick.local",
+  "Volumes": [
+    {
+      "VolumeMount": "D:",
+      "AllocationUnitSize": 4096,
+      "PartitionStyle": "GPT",
+      "VolumeLabel": "Data",
+      "VolumeName": "ebs-az1autoprod-vm-01",
+      "FileSystem": "NTFS"
+    },
+    {
+      "VolumeMount": "E:",
+      "AllocationUnitSize": 65536,
+      "PartitionStyle": "GPT",
+      "VolumeLabel": "Backup",
+      "VolumeName": "ebs-az1autoprod-vm-02",
+      "FileSystem": "NTFS"
+    }
+  ],
+  "Gateway": "172.31.1.1",
+  "ComputerName": "az1autoprod-vm",
+  "OU": "OU=Servers,DC=cloudwick,DC=local",
+  "SQLInstall": false,
+  "IPAddress": "172.31.1.10",
+  "SubnetMask": "255.255.255.0",
+  "DNS": ["172.31.1.11","172.31.1.12"]
+}

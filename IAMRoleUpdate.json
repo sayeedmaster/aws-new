@@ -1,0 +1,20 @@
+{
+  "Effect": "Allow",
+  "Action": ["ec2:DescribeVolumes"],
+  "Resource": "*"
+},
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject"],
+  "Resource": "arn:aws:s3:::$S3BucketName/$S3BucketKeyPrefix/*"
+},
+{
+  "Effect": "Allow",
+  "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+  "Resource": "arn:aws:ssm:*:*:parameter/domain/*"
+},
+{
+  "Effect": "Allow",
+  "Action": ["kms:Decrypt"],
+  "Resource": "arn:aws:kms:*:*:key/*"
+}
