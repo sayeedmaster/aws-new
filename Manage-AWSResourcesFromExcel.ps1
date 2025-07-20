@@ -981,7 +981,7 @@ try {
     Write-Log "Found $($ec2Configs.Count) EC2 configurations and $($ebsConfigs.Count) EBS volume configurations in Excel"
 
     # Load valid instance types and SR-IOV compatible types
-    $configJsonPath = Join-Path $PSScriptRoot "config.json"
+    $configJsonPath = Join-Path $PSScriptRoot "ec2-config-validation.json"
     $validInstanceTypes = @()
     $sriovCompatibleTypes = @()
     if (Test-Path $configJsonPath) {
@@ -991,7 +991,7 @@ try {
             $sriovCompatibleTypes = $configJson.SRIOVCompatibleTypes
             Write-Log "Loaded $($validInstanceTypes.Count) valid instance types and $($sriovCompatibleTypes.Count) SR-IOV compatible types from $configJsonPath"
         } catch {
-            Write-Log "Failed to read config.json. Instance type and SR-IOV validation will be skipped. Error: $($_.Exception.Message)" "WARN"
+            Write-Log "Failed to read ec2-config-validation.json. Instance type and SR-IOV validation will be skipped. Error: $($_.Exception.Message)" "WARN"
         }
     }
 
