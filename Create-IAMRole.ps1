@@ -108,6 +108,10 @@ Write-Host "Using AWS region: $Region" -ForegroundColor Cyan
     {
       "Effect": "Allow",
       "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeTags",
+        "ec2:DescribeVolumes",
+        "ssm:SendCommand",
         "ssm:GetParameter",
         "ssm:GetParameters",
         "ssm:GetParametersByPath",
@@ -115,7 +119,8 @@ Write-Host "Using AWS region: $Region" -ForegroundColor Cyan
         "s3:GetObject",
         "logs:CreateLogStream",
         "logs:PutLogEvents",
-        "logs:DescribeLogGroups"
+        "logs:DescribeLogGroups",
+        "kms:Decrypt"
       ],
       "Resource": "*"
     }
