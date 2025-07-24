@@ -1,0 +1,7 @@
+System.Collections.Concurrent.ConcurrentBag`1[System.String]
+System.Collections.Concurrent.ConcurrentBag`1[System.String]
+[2025-07-24 22:58:35] [INFO] Exported AMI usage report to D:\SidM\aws-scripts\output\ec2_instances_0accounts_multiregion_filtered_20250724_225742_ami_usage_report.csv
+[2025-07-24 22:58:35] [INFO] Account: ipf-aws-adfs-prod (033047798573): profile 
+[2025-07-24 22:58:35] [INFO] Account: ipf-aws-dmz-prod (213591333276): profile 
+System.Collections.Concurrent.ConcurrentBag`1[System.String]
+[2025-07-24 22:58:35] [INFO] Script completed successfully at 22:58:35

@@ -1,7 +1,7 @@
 {
   "MetadataOptionsHttpTokens": "required",
   "MetadataOptionsHttpEndpoint": "enabled",
-  "MetadataOptionsHttpPutResponseHopLimit": 2,
+  "MetadataOptionsHttpPutResponseHopLimit": 1,
   "InstanceMetadataTags": "disabled",
   "DisableApiTermination": "false",
   "Tags": "Environment=Production,Owner=Cloudwick"

@@ -18,7 +18,7 @@
     Date: July 17, 2025
     Version: 1.0.0
     License: MIT
-    Usage: .\Update-EC2InstanceAttributes.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' -JsonFilePath 'C:\Path\To\EC2_Attributes.json' -DryRun
+    Usage: .\Update-EC2InstanceAttributes.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' -JsonFilePath 'C:\Path\To\ec2-attributes.json' -DryRun
     Requrements: AWS.Tools modules installed in the specified PSModulesPath
     Requirements: ImportExcel module installed in the specified PSModulesPath
     Prerequisites: AWS SSO must be set up in your AWS account
@@ -28,11 +28,11 @@
 .PARAMETERS 
     -PSModulesPath - Path to the directory containing AWS.Tools and ImportExcel modules (mandatory).
     -JsonFilePath - Path to the JSON file containing EC2 attribute key-value pairs (mandatory).
-    -LogFilePath - Path to the log file where script actions will be recorded (optional, default: 'logs\EC2_Update_Log_YYYYMMDD_HHMMSS.log' in script directory).
+    -LogFilePath - Path to the log file where script actions will be recorded (optional, default: 'logs\ec2_Update_Log_YYYYMMDD_HHMMSS.log' in script directory).
     -DryRun - Switch to run the script in dry run mode, simulating actions without modifying AWS resources or the JSON file (optional).
 
 .EXAMPLE
-    .\Update-EC2InstanceAttributes.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' -JsonFilePath 'C:\Path\To\EC2_Attributes.json' -LogFilePath 'C:\Path\To\Logs\EC2_Update_Log.log' -DryRun
+    .\Update-EC2InstanceAttributes.ps1 -PSModulesPath 'C:\Path\To\AWS.Tools' -JsonFilePath 'C:\Path\To\ec2-attributes.json' -LogFilePath 'C:\Path\To\Logs\ec2_Update_Log.log' -DryRun
 #>
 
 param (

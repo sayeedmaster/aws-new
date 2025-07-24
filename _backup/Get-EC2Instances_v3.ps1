@@ -1,3 +1,15 @@
+# Get-EC2Instances.ps1
+# PowerShell script to retrieve EC2 instance details across multiple AWS profiles with interactive selection
+# Uses AWS Tools for PowerShell instead of AWS CLI
+# Supports tag filtering, AMI usage reporting, shared VPC handling, SSORole, Subnet CIDRBlock, and additional instance attributes
+# Outputs instance details and AMI report to CSV files with region-specific filenames
+# Fixed DisableApiTermination and InstanceInitiatedShutdownBehavior retrieval
+# Removed RootVolumeSize and RootVolumeType
+# Fixed VpcOwnerId and VpcIsShared calculation
+# Updated AccountName to use profile name (without sso- prefix and -nonprivFujitsuCSA suffix) if no alias is found
+# Added validation of EC2 tag keys per AWS restrictions with ProblematicTags column
+# Fixed tag key validation to correctly handle spaces and invalid characters
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true, HelpMessage="Path to the directory containing AWS.Tools modules.")]
@@ -32,6 +44,13 @@ function Test-EC2TagKey {
         [string]$TagKey
     )
     try {
+        # AWS EC2 Tag Restrictions (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/work-with-tags-in-IMDS.html)
+        # - Max length: 128 characters
+        # - Allowed characters: Unicode letters (a-z, A-Z), digits (0-9), and specific symbols (_ . : / = + - @)
+        # - Case sensitive
+        # - Cannot start with 'aws:'
+        # - Cannot be empty or null
+        # - Spaces are not allowed
         if ([string]::IsNullOrEmpty($TagKey)) {
             return "Empty or null tag key"
         }
@@ -277,161 +296,36 @@ function Get-SSORoleName {
     }
 }
 
-# Function to get profile for a given account ID
-function Get-ProfileForAccount {
-    param(
-        [string]$AccountId,
-        [string]$Region,
-        [string[]]$AvailableProfiles,
-        [hashtable]$AccountProfileCache
-    )
-    if (-not $AccountId -or $AccountId -eq 'N/A') {
-        Write-Log "No valid AccountId provided for profile lookup" "WARN"
-        return $null
-    }
-    $cacheKey = "${AccountId}:${Region}"
-    if ($AccountProfileCache.ContainsKey($cacheKey)) {
-        Write-Log "Retrieved profile for account ${AccountId} from cache: $($AccountProfileCache[$cacheKey])" "DEBUG"
-        return $AccountProfileCache[$cacheKey]
-    }
-    # Load profiles from ~/.aws/config
-    $configPath = Join-Path $env:USERPROFILE ".aws\config"
-    $allProfiles = @()
-    if (Test-Path $configPath) {
-        try {
-            $configContent = Get-Content -Path $configPath -Raw
-            $profileMatches = [regex]::Matches($configContent, '(?s)\[(profile\s+)?([^\]]+)\](.*?)(?=\[|$)', 'IgnoreCase')
-            foreach ($match in $profileMatches) {
-                $profileName = $match.Groups[2].Value.Trim()
-                $profileContent = $match.Groups[3].Value
-                $allProfiles += [PSCustomObject]@{
-                    ProfileName = $profileName
-                    Content = $profileContent
-                }
-            }
-            Write-Log "Loaded $($allProfiles.Count) profiles from AWS config file" "INFO"
-        } catch {
-            Write-Log "Failed to parse AWS config file: $($_.Exception.Message)" "ERROR"
-        }
-    } else {
-        Write-Log "AWS config file not found at ${configPath}" "WARN"
-    }
-    # Combine available profiles and config profiles, removing duplicates
-    $profilesToCheck = @($AvailableProfiles + ($allProfiles | Select-Object -ExpandProperty ProfileName) | Sort-Object -Unique)
-    Write-Log "Checking profiles for account ${AccountId}: $($profilesToCheck -join ', ')" "DEBUG"
-    foreach ($profile in $profilesToCheck) {
-        try {
-            $identity = Get-STSCallerIdentity -ProfileName $profile -Region $Region -ErrorAction Stop
-            if ($identity.Account -eq $AccountId) {
-                $AccountProfileCache[$cacheKey] = $profile
-                Write-Log "Mapped account ${AccountId} to profile ${profile} via Get-STSCallerIdentity" "INFO"
-                return $profile
-            }
-        } catch {
-            Write-Log "Failed to get identity for profile ${profile}: $($_.Exception.Message)" "DEBUG"
-            # Check if profile has SSO configuration
-            $profileConfig = $allProfiles | Where-Object { $_.ProfileName -eq $profile }
-            if ($profileConfig -and $profileConfig.Content -match 'sso_account_id\s*=\s*([^\s#]+)') {
-                $ssoAccountId = $matches[1]
-                if ($ssoAccountId -eq $AccountId) {
-                    Write-Log "Profile ${profile} matches sso_account_id ${AccountId}. Attempting SSO login." "INFO"
-                    try {
-                        # Run aws sso login
-                        $process = Start-Process -FilePath "aws" -ArgumentList "sso login --profile ${profile}" -NoNewWindow -PassThru -Wait
-                        if ($process.ExitCode -eq 0) {
-                            Write-Log "SSO login successful for profile ${profile}" "INFO"
-                            # Verify account ID after login
-                            $identity = Get-STSCallerIdentity -ProfileName $profile -Region $Region -ErrorAction Stop
-                            if ($identity.Account -eq $AccountId) {
-                                $AccountProfileCache[$cacheKey] = $profile
-                                Write-Log "Mapped account ${AccountId} to profile ${profile} after SSO login" "INFO"
-                                return $profile
-                            } else {
-                                Write-Log "SSO login for profile ${profile} did not match account ${AccountId}" "WARN"
-                            }
-                        } else {
-                            Write-Log "SSO login failed for profile ${profile}: Exit code $($process.ExitCode)" "ERROR"
-                        }
-                    } catch {
-                        Write-Log "Failed to perform SSO login for profile ${profile}: $($_.Exception.Message)" "ERROR"
-                    }
-                }
-            }
-        }
-    }
-    Write-Log "No profile found for account ${AccountId} after checking all profiles" "WARN"
-    return $null
-}
-
-# Function to get subnet CIDR block and name
+# Function to get subnet CIDR block
 function Get-SubnetCidrBlock {
     param(
         [string]$SubnetId,
         [string]$Region,
         [string]$ProfileName,
-        [string]$VpcOwnerId,
-        [string[]]$AvailableProfiles,
-        [hashtable]$SubnetCache,
-        [hashtable]$AccountProfileCache,
-        [bool]$IsSharedVPC = $false
+        [hashtable]$SubnetCache
     )
     if (-not $SubnetId -or $SubnetId -eq 'N/A') {
-        Write-Log "No valid SubnetId provided: ${SubnetId}" "WARN"
-        return @{ CidrBlock = 'N/A'; SubnetName = 'N/A' }
+        return 'N/A'
     }
     $cacheKey = "${ProfileName}:${Region}:${SubnetId}"
-    # Check cache only if not a shared VPC
-    if (-not $IsSharedVPC -and $SubnetCache.ContainsKey($cacheKey)) {
-        Write-Log "Retrieved subnet info for ${SubnetId} from cache: Name=$($SubnetCache[$cacheKey].SubnetName)" "DEBUG"
+    if ($SubnetCache.ContainsKey($cacheKey)) {
+        Write-Log "Retrieved CIDR block for subnet ${SubnetId} from cache" "DEBUG"
         return $SubnetCache[$cacheKey]
     }
-    $maxRetries = 3
-    $profilesToTry = @()
-    # For shared VPCs, prioritize the VPC owner's profile
-    if ($IsSharedVPC -and $VpcOwnerId -and $VpcOwnerId -ne 'N/A' -and $VpcOwnerId -ne 'VPC Query Error') {
-        Write-Log "Detected shared VPC (OwnerId: ${VpcOwnerId}). Prioritizing owner profile for subnet ${SubnetId}." "INFO"
-        $ownerProfile = Get-ProfileForAccount -AccountId $VpcOwnerId -Region $Region -AvailableProfiles $AvailableProfiles -AccountProfileCache $AccountProfileCache
-        if ($ownerProfile) {
-            $profilesToTry += $ownerProfile
-            Write-Log "Using profile ${ownerProfile} for VPC owner ${VpcOwnerId}" "INFO"
+    try {
+        $subnet = Get-EC2Subnet -SubnetId $SubnetId -ProfileName $ProfileName -Region $Region -ErrorAction Stop
+        if ($subnet -and $subnet.CidrBlock) {
+            $SubnetCache[$cacheKey] = $subnet.CidrBlock
+            Write-Log "Retrieved CIDR block '$($subnet.CidrBlock)' for subnet ${SubnetId}" "INFO"
+            return $subnet.CidrBlock
         } else {
-            Write-Log "No profile found for VPC owner ${VpcOwnerId}" "WARN"
+            Write-Log "No CIDR block found for subnet ${SubnetId}" "WARN"
+            return "N/A"
         }
+    } catch {
+        Write-Log "Error retrieving CIDR block for subnet ${SubnetId}: $($_.Exception.Message)" "WARN"
+        return "Subnet Query Error (${SubnetId})"
     }
-    # Add the current profile if not already included
-    if ($ProfileName -and $profilesToTry -notcontains $ProfileName) {
-        $profilesToTry += $ProfileName
-    }
-    # Add remaining available profiles
-    $profilesToTry += $AvailableProfiles | Where-Object { $_ -notin $profilesToTry }
-    # Try each profile
-    foreach ($profile in $profilesToTry) {
-        $retryCount = 0
-        while ($retryCount -lt $maxRetries) {
-            try {
-                $subnet = Get-EC2Subnet -SubnetId $SubnetId -ProfileName $profile -Region $Region -ErrorAction Stop
-                $subnetInfo = @{
-                    CidrBlock = if ($subnet.CidrBlock) { $subnet.CidrBlock } else { 'N/A' }
-                    SubnetName = ($subnet.Tags | Where-Object { $_.Key -eq 'Name' } | Select-Object -ExpandProperty Value) ?? 'N/A'
-                }
-                $SubnetCache[$cacheKey] = $subnetInfo
-                Write-Log "Successfully retrieved subnet info for ${SubnetId} with profile ${profile}: CIDR=$($subnetInfo.CidrBlock), Name=$($subnetInfo.SubnetName)" "INFO"
-                return $subnetInfo
-            } catch {
-                $retryCount++
-                Write-Log "Retry $retryCount/$maxRetries for subnet ${SubnetId} with profile ${profile}: $($_.Exception.Message)" "WARN"
-                if ($retryCount -eq $maxRetries) {
-                    Write-Log "Failed to query subnet ${SubnetId} with profile ${profile}: $($_.Exception.Message)" "ERROR"
-                    break
-                }
-                Start-Sleep -Seconds (2 * $retryCount)
-            }
-        }
-    }
-    Write-Log "Unable to retrieve subnet info for ${SubnetId} after trying all profiles" "ERROR"
-    $subnetInfo = @{ CidrBlock = "Subnet Query Error (${SubnetId})"; SubnetName = "Subnet Query Error (${SubnetId})" }
-    $SubnetCache[$cacheKey] = $subnetInfo
-    return $subnetInfo
 }
 
 # Function to get VPC OwnerId
@@ -440,72 +334,30 @@ function Get-VpcOwnerId {
         [string]$VpcId,
         [string]$Region,
         [string]$ProfileName,
-        [string[]]$AvailableProfiles,
-        [hashtable]$VpcCache,
-        [hashtable]$AccountProfileCache
+        [hashtable]$VpcCache
     )
     if (-not $VpcId -or $VpcId -eq 'N/A') {
-        Write-Log "No valid VpcId provided: ${VpcId}" "WARN"
         return 'N/A'
     }
     $cacheKey = "${ProfileName}:${Region}:${VpcId}"
     if ($VpcCache.ContainsKey($cacheKey)) {
-        Write-Log "Retrieved VPC OwnerId for VPC ${VpcId} from cache: $($VpcCache[$cacheKey])" "DEBUG"
+        Write-Log "Retrieved VPC OwnerId for VPC ${VpcId} from cache" "DEBUG"
         return $VpcCache[$cacheKey]
     }
-    # Try with the provided profile first
-    $maxRetries = 3
-    $retryCount = 0
-    while ($retryCount -lt $maxRetries) {
-        try {
-            $vpc = Get-EC2VPC -VpcId $VpcId -ProfileName $ProfileName -Region $Region -ErrorAction Stop
-            if ($vpc -and $vpc.OwnerId) {
-                $VpcCache[$cacheKey] = $vpc.OwnerId
-                Write-Log "Retrieved OwnerId '$($vpc.OwnerId)' for VPC ${VpcId} with profile ${ProfileName}" "INFO"
-                return $vpc.OwnerId
-            } else {
-                Write-Log "No OwnerId found for VPC ${VpcId} with profile ${ProfileName}" "WARN"
-                break
-            }
-        } catch {
-            $retryCount++
-            Write-Log "Retry $retryCount/$maxRetries for VPC ${VpcId} with profile ${ProfileName}: $($_.Exception.Message)" "WARN"
-            if ($retryCount -eq $maxRetries) {
-                Write-Log "Failed to retrieve OwnerId for VPC ${VpcId} with profile ${ProfileName}: $($_.Exception.Message)" "ERROR"
-                break
-            }
-            Start-Sleep -Seconds (2 * $retryCount)
+    try {
+        $vpc = Get-EC2VPC -VpcId $VpcId -ProfileName $ProfileName -Region $Region -ErrorAction Stop
+        if ($vpc -and $vpc.OwnerId) {
+            $VpcCache[$cacheKey] = $vpc.OwnerId
+            Write-Log "Retrieved OwnerId '$($vpc.OwnerId)' for VPC ${VpcId}" "INFO"
+            return $vpc.OwnerId
+        } else {
+            Write-Log "No OwnerId found for VPC ${VpcId}" "WARN"
+            return "N/A"
         }
+    } catch {
+        Write-Log "Error retrieving OwnerId for VPC ${VpcId}: $($_.Exception.Message)" "WARN"
+        return "VPC Query Error (${VpcId})"
     }
-    # Try other available profiles
-    Write-Log "Attempting VPC query for ${VpcId} with all available profiles" "INFO"
-    foreach ($fallbackProfile in $AvailableProfiles) {
-        if ($fallbackProfile -eq $ProfileName) { continue }
-        $retryCount = 0
-        while ($retryCount -lt $maxRetries) {
-            try {
-                $vpc = Get-EC2VPC -VpcId $VpcId -ProfileName $fallbackProfile -Region $Region -ErrorAction Stop
-                if ($vpc -and $vpc.OwnerId) {
-                    $VpcCache[$cacheKey] = $vpc.OwnerId
-                    Write-Log "Retrieved OwnerId '$($vpc.OwnerId)' for VPC ${VpcId} with fallback profile ${fallbackProfile}" "INFO"
-                    return $vpc.OwnerId
-                } else {
-                    Write-Log "No OwnerId found for VPC ${VpcId} with fallback profile ${fallbackProfile}" "WARN"
-                    break
-                }
-            } catch {
-                $retryCount++
-                Write-Log "Retry $retryCount/$maxRetries for VPC ${VpcId} with fallback profile ${fallbackProfile}: $($_.Exception.Message)" "WARN"
-                if ($retryCount -eq $maxRetries) {
-                    Write-Log "Failed to retrieve OwnerId for VPC ${VpcId} with fallback profile ${fallbackProfile}: $($_.Exception.Message)" "ERROR"
-                    break
-                }
-                Start-Sleep -Seconds (2 * $retryCount)
-            }
-        }
-    }
-    Write-Log "Unable to retrieve OwnerId for VPC ${VpcId} after trying all profiles" "ERROR"
-    return "VPC Query Error (${VpcId})"
 }
 
 # Function to get instance attributes (DisableApiTermination, InstanceInitiatedShutdownBehavior)
@@ -564,7 +416,7 @@ function Get-AmiUsageReport {
                 $ami = $amiDetails[0]
                 $amiDescription = if ($ami.Description) { $ami.Description } else { 'N/A' }
                 $amiArchitecture = if ($ami.Architecture) { $ami.Architecture } else { 'N/A' }
-                $amiPlatform = if ($ami.PlatformDetails) { $ami.PlatformDetails } else { 'N/A' }
+                $amiPlatform = if ($ami.PlatformDetails) { $ami.PlatformDetails } else { 'Linux/UNIX' }
                 $amiCreationDate = if ($ami.CreationDate) { $ami.CreationDate } else { 'N/A' }
                 $amiOwnerId = if ($ami.OwnerId) { $ami.OwnerId } else { 'N/A' }
                 $amiState = if ($ami.State) { $ami.State } else { 'N/A' }
@@ -620,9 +472,7 @@ function Get-EC2InstancesForProfile {
         [string]$Region,
         [bool]$FilterTags,
         [hashtable]$SubnetCache,
-        [hashtable]$VpcCache,
-        [hashtable]$AccountProfileCache,
-        [string[]]$AvailableProfiles
+        [hashtable]$VpcCache
     )
     $DisplayProfileName = if ($ProfileName) { $ProfileName } else { 'Default' }
     Write-Log "Processing profile: ${DisplayProfileName}" "INFO"
@@ -803,10 +653,9 @@ try {
         Write-Log "Found $($profileList.Count) profiles" "INFO"
     }
 
-    # Test profile connectivity and build account-to-profile mapping
-    $accountProfileCache = @{}
+    # Test profile connectivity
     if ($TestProfilesFirst -and $AwsProfiles) {
-        Write-Log "Testing AWS profile connectivity and building account-to-profile mapping" "INFO"
+        Write-Log "Testing AWS profile connectivity" "INFO"
         $validProfiles = @()
         foreach ($profile in $AwsProfiles) {
             $currentRegion = Get-ValidAWSRegion -Region $Region -ProfileName $profile
@@ -816,13 +665,6 @@ try {
             }
             if (Test-AwsProfileConnectivity -ProfileName $profile -Region $currentRegion) {
                 $validProfiles += $profile
-                try {
-                    $identity = Get-STSCallerIdentity -ProfileName $profile -Region $currentRegion -ErrorAction Stop
-                    $accountProfileCache["$($identity.Account):$currentRegion"] = $profile
-                    Write-Log "Mapped account $($identity.Account) in region ${currentRegion} to profile ${profile}" "INFO"
-                } catch {
-                    Write-Log "Failed to map account for profile ${profile}: $($_.Exception.Message)" "WARN"
-                }
             }
         }
         if ($validProfiles.Count -eq 0) {
@@ -838,7 +680,7 @@ try {
     $allAmiReports = @()
     $processedAccounts = @()
     $instanceIdsProcessed = @{} # Track processed instances to avoid duplicates
-    $subnetCache = @{} # Cache subnet CIDR blocks and names
+    $subnetCache = @{} # Cache subnet CIDR blocks
     $attributeCache = @{} # Cache instance attributes
     $vpcCache = @{} # Cache VPC OwnerIds
     $regionsUsed = @() # Track regions used across profiles
@@ -855,7 +697,7 @@ try {
             Write-Log "Added region ${currentRegion} to regions used" "INFO"
         }
         $ssoRole = Get-SSORoleName -ProfileName $profileName -Region $currentRegion
-        $instances, $accountName, $accountId = Get-EC2InstancesForProfile -ProfileName $profileName -Region $currentRegion -FilterTags $FilterProblematicTags -SubnetCache $subnetCache -VpcCache $vpcCache -AccountProfileCache $accountProfileCache -AvailableProfiles $AwsProfiles
+        $instances, $accountName, $accountId = Get-EC2InstancesForProfile -ProfileName $profileName -Region $currentRegion -FilterTags $FilterProblematicTags -SubnetCache $subnetCache -VpcCache $vpcCache
         if (-not $instances) {
             Write-Log "No instances or unable to retrieve data for profile ${profileName}" "WARN"
             continue
@@ -890,8 +732,6 @@ try {
                 $fcmsMonitoringValue = Get-ResourceTagValue -Resource $instance -TagName "fcms:CustomMonitoring"
                 $roleValue = Get-ResourceTagValue -Resource $instance -TagName "role"
                 $applicationValue = Get-ResourceTagValue -Resource $instance -TagName "application"
-                $patchGroupValue = Get-ResourceTagValue -Resource $instance -TagName "PatchGroup"
-                $autoPatchValue = Get-ResourceTagValue -Resource $instance -TagName "AutoPatch"
                 $vCPU = if ($instance.CpuOptions.CoreCount -and $instance.CpuOptions.ThreadsPerCore) {
                     $instance.CpuOptions.CoreCount * $instance.CpuOptions.ThreadsPerCore
                 } else { "N/A (Lookup needed for $($instance.InstanceType))" }
@@ -921,19 +761,9 @@ try {
                 $tagsFormatted = if ($tags -and $tags.Count -gt 0) {
                     ($tags | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ';'
                 } else { "N/A" }
-                $vpcOwnerId = Get-VpcOwnerId -VpcId $instance.VpcId -Region $currentRegion -ProfileName $profileName -AvailableProfiles $AwsProfiles -VpcCache $vpcCache -AccountProfileCache $accountProfileCache
-                $isSharedVPC = if ($instance.VpcId -and $vpcOwnerId -ne 'N/A' -and $vpcOwnerId -ne 'VPC Query Error' -and $vpcOwnerId -ne $accountId) { 
-                    Write-Log "Identified shared VPC for $($instance.VpcId): VpcOwnerId=$vpcOwnerId, AccountId=$accountId" "INFO"
-                    $true 
-                } else { 
-                    if ($instance.VpcId) {
-                        Write-Log "VPC $($instance.VpcId) not identified as shared: VpcOwnerId=$vpcOwnerId, AccountId=$accountId" "DEBUG"
-                    } else {
-                        Write-Log "No valid VpcId provided for instance $($instance.InstanceId): VpcOwnerId=$vpcOwnerId, AccountId=$accountId" "WARN"
-                    }
-                    $false 
-                }
-                $subnetInfo = Get-SubnetCidrBlock -SubnetId $instance.SubnetId -Region $currentRegion -ProfileName $profileName -VpcOwnerId $vpcOwnerId -AvailableProfiles $AwsProfiles -SubnetCache $subnetCache -AccountProfileCache $accountProfileCache -IsSharedVPC $isSharedVPC
+                $vpcOwnerId = Get-VpcOwnerId -VpcId $instance.VpcId -Region $currentRegion -ProfileName $profileName -VpcCache $vpcCache
+                $isSharedVPC = if ($instance.VpcId -and $vpcOwnerId -ne 'N/A' -and $vpcOwnerId -ne $accountId) { $true } else { $false }
+                $cidrBlock = Get-SubnetCidrBlock -SubnetId $instance.SubnetId -Region $currentRegion -ProfileName $profileName -SubnetCache $subnetCache
                 $attributes = Get-InstanceAttributes -InstanceId $instance.InstanceId -Region $currentRegion -ProfileName $profileName -AttributeCache $attributeCache
                 $disableApiTermination = $attributes.DisableApiTermination
                 $shutdownBehavior = $attributes.InstanceInitiatedShutdownBehavior
@@ -963,16 +793,13 @@ try {
                     FcmsCustomMonitoring = $fcmsMonitoringValue
                     Role = $roleValue
                     Application = $applicationValue
-                    PatchGroup = $patchGroupValue
-                    AutoPatch = $autoPatchValue
                     InstanceState = $instance.State.Name
                     AvailabilityZone = $instance.Placement.AvailabilityZone
                     VpcId = $instance.VpcId
                     VpcOwnerId = $vpcOwnerId
                     VpcIsShared = $isSharedVPC
                     SubnetId = $instance.SubnetId
-                    SubnetName = $subnetInfo.SubnetName
-                    CidrBlock = $subnetInfo.CidrBlock
+                    CidrBlock = $cidrBlock
                     PrivateIpAddress = $instance.PrivateIpAddress
                     SecondaryPrivateIPs = $secondaryPrivateIps
                     Platform = $platformDisplay
@@ -1032,7 +859,7 @@ try {
     # Display summary
     Write-Host "`nEC2 Instance Analysis Summary" -ForegroundColor Cyan
     Write-Host "============================" -ForegroundColor Cyan
-    Write-Host "Script version: 12.19 (Added AWS config profile parsing and SSO login)" -ForegroundColor Green
+    Write-Host "Script version: 12.10 (EC2 Inventory + AMI Usage Reporting with PowerShell modules, SSORole, CIDRBlock, additional attributes, region-specific filenames, fixed termination/shutdown attributes, fixed VpcOwnerId/VpcIsShared, updated AccountName derivation, added EC2 tag key validation, fixed space detection in tag keys)" -ForegroundColor Green
     Write-Host "Tag filtering enabled: $FilterProblematicTags" -ForegroundColor Green
     if ($FilterProblematicTags) {
         Write-Host "Filtered tags: $($ProblematicTags -join ', ')" -ForegroundColor Gray
