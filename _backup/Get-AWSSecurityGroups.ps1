@@ -1,11 +1,8 @@
-#Requires -Version 5.1
-#Requires -Modules @{ModuleName="AWS.Tools.Common"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.EC2"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.SecurityToken"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.IdentityManagement"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.ElasticLoadBalancingV2"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.FSx"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.RDS"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.ElastiCache"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.Redshift"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.EFS"; ModuleVersion="4.1.0.0"}, @{ModuleName="AWS.Tools.Lambda"; ModuleVersion="4.1.0.0"}
-
 <#
 .SYNOPSIS
-    Retrieves all security groups in AWS accounts, enumerates services that use security groups, and checks their usage with counts for each service.
+    Retrieves all security groups in AWS accounts and checks if they are attached to EC2 instances.
 .DESCRIPTION
-    This script dynamically identifies AWS services that use security groups (e.g., EC2, RDS, ELB, FSx, API Gateway, etc.), queries their resources to count security group attachments, and reports results in a CSV file. It supports profile filtering, pagination, and logging. Output includes dynamic columns for each service's usage count (e.g., EC2Count, RDSCOUNT, etc.).
+    This script queries AWS security groups in all regions using a single API call per profile/region, caches EC2 instance data to minimize API calls, and determines if each security group is attached to any EC2 instances or is orphaned. Results are logged and exported to a CSV file. A profile filter parameter allows filtering profiles by a regex pattern.
 .PARAMETER PSModulesPath
     Path to the directory containing AWS.Tools modules (required).
 .PARAMETER Region
@@ -114,19 +111,19 @@ function Get-ValidAWSRegion {
     return $defaultRegion
 }
 
-# Function to sanitize strings for filenames and column names
+# Function to sanitize strings for filenames
 function Sanitize-String {
     param([string]$InputString)
     try {
         $fileName = [System.IO.Path]::GetFileName($InputString)
         $directory = [System.IO.Path]::GetDirectoryName($InputString)
-        $sanitizedFileName = $fileName -replace '[^a-zA-Z0-9]', '_'
+        $sanitizedFileName = $fileName -replace '[^a-zA-Z0-9.]', '_'
         $sanitized = if ($directory) { Join-Path $directory $sanitizedFileName } else { $sanitizedFileName }
         Write-Log "Sanitized string '${InputString}' to '${sanitized}' using -replace" "INFO"
         return $sanitized
     } catch {
         Write-Log "Error with -replace on '${InputString}': $($_.Exception.Message). Using regex fallback." "ERROR"
-        $sanitizedFileName = [regex]::Replace([System.IO.Path]::GetFileName($InputString), '[^a-zA-Z0-9]', '_')
+        $sanitizedFileName = [regex]::Replace([System.IO.Path]::GetFileName($InputString), '[^a-zA-Z0-9.]', '_')
         $sanitized = if ($directory) { Join-Path $directory $sanitizedFileName } else { $sanitizedFileName }
         Write-Log "Sanitized string '${InputString}' to '${sanitized}' using regex" "INFO"
         return $sanitized
@@ -247,197 +244,13 @@ function Get-ProfileForAccount {
     return $null
 }
 
-# Function to enumerate AWS services that use security groups
-function Get-SecurityGroupServices {
+# Function to build security group attachment cache
+function Build-SecurityGroupAttachmentCache {
     param(
         [string]$ProfileName,
         [string]$Region
     )
-    $services = @{}
-    $displayProfileName = if ($ProfileName) { $ProfileName } else { 'Default' }
-    Write-Log "Enumerating AWS services that use security groups for profile ${displayProfileName} in region ${Region}" "INFO"
-
-    # Predefined services known to use security groups
-    $knownServices = @{
-        "EC2" = @{
-            Cmdlet = "Get-EC2Instance"
-            Module = "AWS.Tools.EC2"
-            Permission = "ec2:DescribeInstances"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource.Instances | ForEach-Object { $_.SecurityGroups } | Select-Object -ExpandProperty GroupId
-            }
-            Count = {
-                param($resources)
-                ($resources.Instances | Measure-Object).Count
-            }
-        }
-        "ENI" = @{
-            Cmdlet = "Get-EC2NetworkInterface"
-            Module = "AWS.Tools.EC2"
-            Permission = "ec2:DescribeNetworkInterfaces"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource | ForEach-Object { $_.Groups } | Select-Object -ExpandProperty GroupId
-            }
-            Count = {
-                param($resources)
-                ($resources | Measure-Object).Count
-            }
-        }
-        "ELB" = @{
-            Cmdlet = "Get-ELB2LoadBalancer"
-            Module = "AWS.Tools.ElasticLoadBalancingV2"
-            Permission = "elasticloadbalancing:DescribeLoadBalancers"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource | ForEach-Object { $_.SecurityGroups }
-            }
-            Count = {
-                param($resources)
-                ($resources | Measure-Object).Count
-            }
-        }
-        "FSx" = @{
-            Cmdlet = "Get-FSxFileSystem"
-            Module = "AWS.Tools.FSx"
-            Permission = "fsx:DescribeFileSystems"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource | ForEach-Object {
-                    $fs = $_
-                    $fs.NetworkInterfaceIds | ForEach-Object {
-                        $eni = Get-EC2NetworkInterface -NetworkInterfaceId $_ @params -ErrorAction Stop
-                        $eni.Groups
-                    }
-                } | Select-Object -ExpandProperty GroupId
-            }
-            Count = {
-                param($resources)
-                ($resources | Measure-Object).Count
-            }
-        }
-        "RDS" = @{
-            Cmdlet = "Get-RDSDBInstance"
-            Module = "AWS.Tools.RDS"
-            Permission = "rds:DescribeDBInstances"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource | ForEach-Object { $_.VpcSecurityGroups } | Where-Object { $_.Status -eq "active" } | Select-Object -ExpandProperty VpcSecurityGroupId
-            }
-            Count = {
-                param($resources)
-                ($resources | Measure-Object).Count
-            }
-        }
-        "ElastiCache" = @{
-            Cmdlet = "Get-ECCluster"
-            Module = "AWS.Tools.ElastiCache"
-            Permission = "elasticache:DescribeCacheClusters"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource | Where-Object { $_.CacheClusterStatus -eq "available" } | ForEach-Object { $_.SecurityGroups } | Select-Object -ExpandProperty SecurityGroupId
-            }
-            Count = {
-                param($resources)
-                ($resources | Where-Object { $_.CacheClusterStatus -eq "available" } | Measure-Object).Count
-            }
-        }
-        "Redshift" = @{
-            Cmdlet = "Get-RSCluster"
-            Module = "AWS.Tools.Redshift"
-            Permission = "redshift:DescribeClusters"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource | ForEach-Object { $_.VpcSecurityGroups } | Where-Object { $_.Status -eq "active" } | Select-Object -ExpandProperty VpcSecurityGroupId
-            }
-            Count = {
-                param($resources)
-                ($resources | Measure-Object).Count
-            }
-        }
-        "EFS" = @{
-            Cmdlet = "Get-EFSMountTarget"
-            Module = "AWS.Tools.EFS"
-            Permission = "elasticfilesystem:DescribeMountTargets"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource | ForEach-Object { $_.SecurityGroups }
-            }
-            Count = {
-                param($resources)
-                ($resources | Measure-Object).Count
-            }
-        }
-        "Lambda" = @{
-            Cmdlet = "Get-LMFunctionList"
-            Module = "AWS.Tools.Lambda"
-            Permission = "lambda:ListFunctions"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $resource | Where-Object { $_.VpcConfig -and $_.VpcConfig.VpcId } | ForEach-Object { $_.VpcConfig.SecurityGroupIds }
-            }
-            Count = {
-                param($resources)
-                ($resources | Where-Object { $_.VpcConfig -and $_.VpcConfig.VpcId } | Measure-Object).Count
-            }
-        }
-        "TransitGateway" = @{
-            Cmdlet = "Get-EC2TransitGatewayAttachment"
-            Module = "AWS.Tools.EC2"
-            Permission = "ec2:DescribeTransitGatewayAttachments"
-            GetSecurityGroups = {
-                param($resource, $params)
-                $sgIds = @()
-                foreach ($attachment in $resource) {
-                    if ($attachment.ResourceType -eq 'vpc' -and $attachment.ResourceId) {
-                        $subnets = Get-EC2Subnet -Filter @{Name="vpc-id";Values=$attachment.ResourceId} @params -ErrorAction Stop
-                        foreach ($subnet in $subnets) {
-                            $eniParams = @{ Filter = @{Name="subnet-id";Values=$subnet.SubnetId} } + $params
-                            $enis = Get-EC2NetworkInterface @eniParams -ErrorAction Stop
-                            foreach ($eni in $enis) {
-                                if ($eni.Description -match "Transit Gateway") {
-                                    $sgIds += $eni.Groups | Select-Object -ExpandProperty GroupId
-                                }
-                            }
-                        }
-                    }
-                }
-                $sgIds
-            }
-            Count = {
-                param($resources)
-                $count = 0
-                foreach ($attachment in $resources) {
-                    if ($attachment.ResourceType -eq 'vpc' -and $attachment.ResourceId) {
-                        $subnets = Get-EC2Subnet -Filter @{Name="vpc-id";Values=$attachment.ResourceId} @params -ErrorAction Stop
-                        foreach ($subnet in $subnets) {
-                            $eniParams = @{ Filter = @{Name="subnet-id";Values=$subnet.SubnetId} } + $params
-                            $enis = Get-EC2NetworkInterface @eniParams -ErrorAction Stop
-                            $count += ($enis | Where-Object { $_.Description -match "Transit Gateway" } | Measure-Object).Count
-                        }
-                    }
-                }
-                $count
-            }
-        }
-    }
-
-    # Add known services to the list
-    foreach ($serviceName in $knownServices.Keys) {
-        try {
-            if (Get-Command -Name $knownServices[$serviceName].Cmdlet -ModuleName $knownServices[$serviceName].Module -ErrorAction Stop) {
-                $services[$serviceName] = $knownServices[$serviceName]
-                Write-Log "Added service ${serviceName} to check list" "INFO"
-            } else {
-                Write-Log "Cmdlet $($knownServices[$serviceName].Cmdlet) not found in module $($knownServices[$serviceName].Module). Skipping service ${serviceName}." "WARN"
-            }
-        } catch {
-            Write-Log "Error checking cmdlet for service ${serviceName}: $($_.Exception.Message). Skipping." "WARN"
-        }
-    }
-
-    # Discover VPC endpoint services
+    $attachmentCache = @{}
     try {
         $nextToken = $null
         do {
@@ -447,95 +260,20 @@ function Get-SecurityGroupServices {
                 ErrorAction = 'Stop'
             }
             if ($nextToken) { $params.NextToken = $nextToken }
-            $vpcEndpoints = Get-EC2VpcEndpoint @params
-            foreach ($endpoint in $vpcEndpoints) {
-                $serviceName = $endpoint.ServiceName -replace "^com\.amazonaws\.[^\.]+\.", ""
-                $sanitizedServiceName = Sanitize-String -InputString $serviceName
-                if (-not $services.ContainsKey($sanitizedServiceName)) {
-                    $services[$sanitizedServiceName] = @{
-                        Cmdlet = "Get-EC2VpcEndpoint"
-                        Module = "AWS.Tools.EC2"
-                        Permission = "ec2:DescribeVpcEndpoints"
-                        GetSecurityGroups = {
-                            param($resource, $params)
-                            $targetService = $serviceName
-                            $resource | Where-Object { $_.ServiceName -eq $targetService } | ForEach-Object { $_.Groups } | Select-Object -ExpandProperty GroupId
-                        }
-                        Count = {
-                            param($resources)
-                            ($resources | Where-Object { $_.ServiceName -eq $targetService } | Measure-Object).Count
-                        }
+            $reservations = Get-EC2Instance @params
+            foreach ($instance in $reservations.Instances) {
+                foreach ($sg in $instance.SecurityGroups) {
+                    if (-not $attachmentCache.ContainsKey($sg.GroupId)) {
+                        $attachmentCache[$sg.GroupId] = $true
                     }
-                    Write-Log "Added VPC endpoint service ${sanitizedServiceName} to check list" "INFO"
                 }
             }
-            $nextToken = $vpcEndpoints.NextToken
+            $nextToken = $reservations.NextToken
         } while ($nextToken)
+        Write-Log "Built attachment cache with $($attachmentCache.Count) security groups attached to EC2 instances for profile ${ProfileName}" "INFO"
     } catch {
-        Write-Log "Error discovering VPC endpoint services: $($_.Exception.Message)" "ERROR"
-        if ($_.Exception.Message -match "is not authorized") {
-            Write-Log "Check if the profile has 'ec2:DescribeVpcEndpoints' permission" "WARN"
-        }
+        Write-Log "Error building attachment cache for profile ${ProfileName}: $($_.Exception.Message)" "ERROR"
     }
-
-    Write-Log "Found $($services.Count) services that may use security groups: $($services.Keys -join ', ')" "INFO"
-    return $services
-}
-
-# Function to build security group attachment cache with counts
-function Build-SecurityGroupAttachmentCache {
-    param(
-        [string]$ProfileName,
-        [string]$Region,
-        [hashtable]$Services
-    )
-    $attachmentCache = @{}
-    $displayProfileName = if ($ProfileName) { $ProfileName } else { 'Default' }
-    
-    # Initialize attachment cache for each security group
-    function Initialize-SgCache {
-        param([string]$sgId)
-        if (-not $attachmentCache.ContainsKey($sgId)) {
-            $attachmentCache[$sgId] = @{}
-            foreach ($service in $Services.Keys) {
-                $attachmentCache[$sgId][$service] = 0
-            }
-        }
-    }
-
-    # Common parameters for API calls
-    $params = @{
-        ProfileName = $ProfileName
-        Region = $Region
-        ErrorAction = 'Stop'
-    }
-
-    foreach ($serviceName in $Services.Keys) {
-        try {
-            $nextToken = $null
-            do {
-                $callParams = $params.Clone()
-                if ($nextToken) { $callParams.NextToken = $nextToken }
-                $resources = & $Services[$serviceName].Cmdlet @callParams
-                $sgIds = & $Services[$serviceName].GetSecurityGroups -resource $resources -params $callParams
-                foreach ($sgId in $sgIds) {
-                    if ($sgId) {
-                        Initialize-SgCache -sgId $sgId
-                        $attachmentCache[$sgId][$serviceName] += (& $Services[$serviceName].Count -resources $resources)
-                    }
-                }
-                $nextToken = $resources.NextToken
-            } while ($nextToken)
-            Write-Log "Cached $($attachmentCache.Count) security groups from ${serviceName} for profile ${displayProfileName}" "INFO"
-        } catch {
-            Write-Log "Error caching security groups from ${serviceName} for profile ${displayProfileName}: $($_.Exception.Message)" "ERROR"
-            if ($_.Exception.Message -match "is not authorized") {
-                Write-Log "Check if the profile has '$($Services[$serviceName].Permission)' permission" "WARN"
-            }
-        }
-    }
-
-    Write-Log "Built attachment cache with $($attachmentCache.Count) security groups for profile ${displayProfileName}" "INFO"
     return $attachmentCache
 }
 
@@ -545,8 +283,7 @@ function Get-SecurityGroupsForProfile {
         [string]$ProfileName,
         [string]$Region,
         [hashtable]$AccountProfileCache,
-        [string[]]$AvailableProfiles,
-        [hashtable]$Services
+        [string[]]$AvailableProfiles
     )
     $DisplayProfileName = if ($ProfileName) { $ProfileName } else { 'Default' }
     Write-Log "Processing profile: ${DisplayProfileName}" "INFO"
@@ -586,7 +323,7 @@ function Get-SecurityGroupsForProfile {
     $securityGroupsOutput = @()
     try {
         # Build attachment cache
-        $attachmentCache = Build-SecurityGroupAttachmentCache -ProfileName $ProfileName -Region $Region -Services $Services
+        $attachmentCache = Build-SecurityGroupAttachmentCache -ProfileName $ProfileName -Region $Region
         # Retrieve all security groups in one call with pagination
         $nextToken = $null
         do {
@@ -603,9 +340,8 @@ function Get-SecurityGroupsForProfile {
             }
             Write-Log "Retrieved $($securityGroups.Count) security groups for profile ${DisplayProfileName}" "INFO"
             foreach ($sg in $securityGroups) {
-                $counts = $attachmentCache[$sg.GroupId]
-                $isAttached = $counts -and ($Services.Keys | ForEach-Object { $counts[$_] -gt 0 } | Where-Object { $_ } | Measure-Object).Count -gt 0
-                $outputObject = [PSCustomObject]@{
+                $isAttached = $attachmentCache.ContainsKey($sg.GroupId)
+                $securityGroupsOutput += [PSCustomObject]@{
                     AccountName      = $accountName
                     AccountId        = $accountId
                     SSORole          = Get-SSORoleName -ProfileName $ProfileName -Region $Region
@@ -617,21 +353,12 @@ function Get-SecurityGroupsForProfile {
                     IsAttached       = $isAttached
                     Status           = if ($isAttached) { "In Use" } else { "Orphaned" }
                 }
-                # Dynamically add service count fields
-                foreach ($service in $Services.Keys) {
-                    $countField = "${service}Count"
-                    $outputObject | Add-Member -MemberType NoteProperty -Name $countField -Value (if ($counts) { $counts[$service] } else { 0 })
-                }
-                $securityGroupsOutput += $outputObject
             }
             $nextToken = $securityGroups.NextToken
         } while ($nextToken)
         return $securityGroupsOutput, $accountName, $accountId
     } catch {
         Write-Log "Error retrieving security groups for profile ${DisplayProfileName}: $($_.Exception.Message)" "ERROR"
-        if ($_.Exception.Message -match "is not authorized") {
-            Write-Log "Check if the profile has 'ec2:DescribeSecurityGroups' permission" "WARN"
-        }
         return @(), $accountName, $accountId
     }
 }
@@ -715,27 +442,11 @@ try {
 
     # Import AWS Tools modules
     try {
-        $requiredModules = @(
-            "AWS.Tools.Common",
-            "AWS.Tools.EC2",
-            "AWS.Tools.SecurityToken",
-            "AWS.Tools.IdentityManagement",
-            "AWS.Tools.ElasticLoadBalancingV2",
-            "AWS.Tools.FSx",
-            "AWS.Tools.RDS",
-            "AWS.Tools.ElastiCache",
-            "AWS.Tools.Redshift",
-            "AWS.Tools.EFS",
-            "AWS.Tools.Lambda"
-        )
-        foreach ($module in $requiredModules) {
-            if (Test-Path (Join-Path $PSModulesPath $module)) {
-                Import-Module -Name (Join-Path $PSModulesPath $module) -ErrorAction Stop
-                Write-Log "Loaded module ${module}" "INFO"
-            } else {
-                Write-Log "Module ${module} not found at ${PSModulesPath}. Some services may be skipped." "WARN"
-            }
-        }
+        Import-Module -Name (Join-Path $PSModulesPath "AWS.Tools.Common") -ErrorAction Stop
+        Import-Module -Name (Join-Path $PSModulesPath "AWS.Tools.EC2") -ErrorAction Stop
+        Import-Module -Name (Join-Path $PSModulesPath "AWS.Tools.SecurityToken") -ErrorAction Stop
+        Import-Module -Name (Join-Path $PSModulesPath "AWS.Tools.IdentityManagement") -ErrorAction Stop
+        Write-Log "Loaded AWS Tools modules" "INFO"
     } catch {
         Write-Log "Failed to import AWS Tools modules from ${PSModulesPath}: $($_.Exception.Message)" "ERROR"
         exit 1
@@ -829,13 +540,7 @@ try {
             $regionsUsed += $currentRegion
             Write-Log "Added region ${currentRegion} to regions used" "INFO"
         }
-        # Enumerate services for this profile and region
-        $services = Get-SecurityGroupServices -ProfileName $profileName -Region $currentRegion
-        if (-not $services) {
-            Write-Log "No services found that use security groups for profile ${profileName}. Skipping." "WARN"
-            continue
-        }
-        $securityGroups, $accountName, $accountId = Get-SecurityGroupsForProfile -ProfileName $profileName -Region $currentRegion -AccountProfileCache $accountProfileCache -AvailableProfiles $AwsProfiles -Services $services
+        $securityGroups, $accountName, $accountId = Get-SecurityGroupsForProfile -ProfileName $profileName -Region $currentRegion -AccountProfileCache $accountProfileCache -AvailableProfiles $AwsProfiles
         if (-not $securityGroups) {
             Write-Log "No security groups or unable to retrieve data for profile ${profileName}" "WARN"
             continue
@@ -872,7 +577,7 @@ try {
     # Display summary
     Write-Host "`nSecurity Group Analysis Summary" -ForegroundColor Cyan
     Write-Host "==============================" -ForegroundColor Cyan
-    Write-Host "Script version: 1.8 (Dynamically enumerate services using security groups)" -ForegroundColor Green
+    Write-Host "Script version: 1.2 (Optimized with caching and single API call)" -ForegroundColor Green
     Write-Host "Profile filter: $(if ($ProfileFilter) { $ProfileFilter } else { 'None' })" -ForegroundColor Green
     Write-Host "Profiles processed: $($AwsProfiles.Count)" -ForegroundColor Green
     Write-Host "Regions used: $($regionsUsed -join ', ')" -ForegroundColor Green

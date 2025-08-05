@@ -122,17 +122,7 @@ try {
     exit 1
 }
 
-# Set output files with sanitization
-if (-not $OutputFile) {
-    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $regionSafe = if ($Region) { $Region -replace '[^a-zA-Z0-9]', '_' } else { "multiregion" }
-    $filterSuffix = if ($FilterProblematicTags) { "_filtered" } else { "_unfiltered" }
-    $baseName = "ec2_instances_$($AwsProfiles.Count)accounts_${regionSafe}${filterSuffix}_${timestamp}.csv"
-    $OutputFile = Join-Path $OutputDir $baseName
-    $OutputFile = Sanitize-String -InputString $OutputFile
-}
-$AmiOutputFile = $OutputFile -replace "\.csv$", "_ami_usage_report.csv"
-$AmiOutputFile = Sanitize-String -InputString $AmiOutputFile
+# Output files will be set after profile selection
 
 # Get AWS profiles with interactive or manual selection
 if (-not $AwsProfiles) {
@@ -161,6 +151,19 @@ if (-not $AwsProfiles) {
     }
 }
 
+# Set output files with sanitization (after profile selection)
+if (-not $OutputFile) {
+    $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $regionSafe = if ($Region) { $Region -replace '[^a-zA-Z0-9]', '_' } else { "multiregion" }
+    $filterSuffix = if ($FilterProblematicTags) { "_filtered" } else { "_unfiltered" }
+    $accountCount = if ($AwsProfiles -and $AwsProfiles.Count -gt 0) { $AwsProfiles.Count } else { 0 }
+    $baseName = "ec2_instances_${accountCount}accounts_${regionSafe}${filterSuffix}_${timestamp}.csv"
+    $OutputFile = Join-Path $OutputDir $baseName
+    $OutputFile = Sanitize-String -InputString $OutputFile
+}
+$AmiOutputFile = $OutputFile -replace "\.csv$", "_ami_usage_report.csv"
+$AmiOutputFile = Sanitize-String -InputString $AmiOutputFile
+
 # Test profile connectivity and build account-to-profile mapping
 $accountProfileCache = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new()
 $subnetCache = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
@@ -173,15 +176,15 @@ $processedAccounts = [System.Collections.Concurrent.ConcurrentBag[PSObject]]::ne
 $outputBag = [System.Collections.Concurrent.ConcurrentBag[PSObject]]::new()
 if ($TestProfilesFirst -and $AwsProfiles) {
     $validProfiles = @()
-    foreach ($profile in $AwsProfiles) {
+    foreach ($profileName in $AwsProfiles) {
         $currentRegion = $Region ? $Region : "eu-west-1"
-        if (Test-AwsProfileConnectivity -ProfileName $profile -Region $currentRegion) {
-            $validProfiles += $profile
+        if (Test-AwsProfileConnectivity -ProfileName $profileName -Region $currentRegion) {
+            $validProfiles += $profileName
             try {
-                $identity = Get-STSCallerIdentity -ProfileName $profile -Region $currentRegion -ErrorAction Stop
-                if ($identity) { $accountProfileCache.TryAdd("$($identity.Account):$currentRegion", $profile) }
+                $identity = Get-STSCallerIdentity -ProfileName $profileName -Region $currentRegion -ErrorAction Stop
+                if ($identity) { $accountProfileCache.TryAdd("$($identity.Account):$currentRegion", $profileName) }
             } catch {
-                Add-Content -Path $LogFilePath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] [WARN] Failed to get identity for profile ${profile}: $($_.Exception.Message)"
+                Add-Content -Path $LogFilePath -Value "[$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))] [WARN] Failed to get identity for profile ${profileName}: $($_.Exception.Message)"
             }
         }
     }
@@ -354,7 +357,7 @@ $results = $AwsProfiles | ForEach-Object -Parallel {
                 CWMonitoring = switch ($instance.Monitoring.State) { "enabled" { "Detailed" } "disabled" { "Basic" } "pending" { "Pending" } default { $instance.Monitoring.State ?? "N/A" } }
                 vCPU = if ($instance.CpuOptions.CoreCount -and $instance.CpuOptions.ThreadsPerCore) { $instance.CpuOptions.CoreCount * $instance.CpuOptions.ThreadsPerCore } else { "N/A" }
                 AMIId = $instance.ImageId
-                AMIName = Get-AMIName -AmiId $instance.ImageId -Region $Region -ProfileName $ProfileName
+                AMIName = [string](Get-AMIName -AmiId $instance.ImageId -Region $Region -ProfileName $ProfileName)
                 IamInstanceProfile = if ($instance.IamInstanceProfile -and $instance.IamInstanceProfile.Arn) { $instance.IamInstanceProfile.Arn } else { "N/A" }
                 EbsOptimized = $instance.EbsOptimized
                 MetadataOptionsHttpTokens = $instance.MetadataOptions.HttpTokens ?? "N/A"
@@ -391,14 +394,38 @@ $results = $AwsProfiles | ForEach-Object -Parallel {
             $configPath = Join-Path $env:USERPROFILE ".aws\config"
             if (Test-Path $configPath) {
                 $configContent = Get-Content -Path $configPath -Raw
-                $profileSection = if ($ProfileName) { "\[(profile\s+)?${ProfileName}\]" } else { "\[default\]" }
-                if ($configContent -match "(?s)$profileSection.*?\nsso_role_name\s*=\s*([^\s#]+)") { return $matches[1] }
+                $profileSection = if ($ProfileName) { "\[(profile\s+)?$([regex]::Escape($ProfileName))\]" } else { "\[default\]" }
+                Write-Log "Looking for profile section with pattern: $profileSection" "DEBUG"
+                if ($configContent -match "(?s)$profileSection.*?\nsso_role_name\s*=\s*([^\s#\r\n]+)") { 
+                    $ssoRoleName = $matches[1].Trim()
+                    Write-Log "Retrieved SSO role name '$ssoRoleName' from config for profile $ProfileName" "DEBUG"
+                    return $ssoRoleName
+                } else {
+                    Write-Log "No sso_role_name found in config for profile $ProfileName" "DEBUG"
+                }
+            } else {
+                Write-Log "AWS config file not found at $configPath" "DEBUG"
             }
+            Write-Log "Attempting to get SSO role from STS caller identity for profile $ProfileName" "DEBUG"
             $identity = Invoke-AwsApiCall -ApiCall { Get-STSCallerIdentity -ProfileName $ProfileName -Region $Region -ErrorAction Stop } -ProfileName $ProfileName -Region $Region -OperationDescription "Get caller identity for $ProfileName"
-            if ($identity.Arn -match 'assumed-role/([^/]+)/') { return $matches[1] }
+            if ($identity -and $identity.Arn) {
+                Write-Log "Got ARN: $($identity.Arn)" "DEBUG"
+                if ($identity.Arn -match 'assumed-role/([^/]+)/') { 
+                    $ssoRoleName = $matches[1]
+                    Write-Log "Retrieved SSO role name '$ssoRoleName' from ARN for profile $ProfileName" "DEBUG"
+                    return $ssoRoleName
+                } else {
+                    Write-Log "ARN pattern did not match assumed-role format: $($identity.Arn)" "DEBUG"
+                }
+            } else {
+                Write-Log "Failed to get valid identity or ARN for profile $ProfileName" "DEBUG"
+            }
             Write-Log "Could not determine SSO role for profile ${ProfileName}. Using 'Unknown'." "WARN"
             return "Unknown"
-        } catch { Write-Log "Error retrieving SSO role for profile ${ProfileName}: $($_.Exception.Message)" "WARN"; return "Unknown" }
+        } catch { 
+            Write-Log "Error retrieving SSO role for profile ${ProfileName}: $($_.Exception.Message)" "WARN"
+            return "Unknown" 
+        }
     }
 
     # Define Get-AMIName function
@@ -406,16 +433,114 @@ $results = $AwsProfiles | ForEach-Object -Parallel {
         param([string]$AmiId, [string]$Region, [string]$ProfileName)
         if (-not $AmiId) { return 'N/A' }
         $cacheKey = "${ProfileName}:${Region}:${AmiId}"
-        if ($local_amiCache.ContainsKey($cacheKey)) { return $local_amiCache[$cacheKey].Name }
+        if ($local_amiCache.ContainsKey($cacheKey)) { 
+            $cachedInfo = $local_amiCache[$cacheKey]
+            $cachedName = $cachedInfo.Name
+            if ($cachedName -is [string]) { 
+                return $cachedName 
+            } else { 
+                return $cachedName.ToString() 
+            }
+        }
         try {
             $ami = Invoke-AwsApiCall -ApiCall { Get-EC2Image -ImageId $AmiId -ProfileName $ProfileName -Region $Region -ErrorAction Stop } -ProfileName $ProfileName -Region $Region -OperationDescription "Get AMI $AmiId"
-            $amiInfo = @{ Name = $ami[0].Name ?? "AMI No Name (${AmiId})"; Description = $ami[0].Description ?? 'N/A'; Architecture = $ami[0].Architecture ?? 'N/A'; Platform = $ami[0].PlatformDetails ?? 'N/A'; CreationDate = $ami[0].CreationDate ?? 'N/A'; OwnerId = $ami[0].OwnerId ?? 'N/A'; State = $ami[0].State ?? 'N/A'; Public = $ami[0].Public ?? $false }
-            $local_amiCache.TryAdd($cacheKey, $amiInfo)
-            return $amiInfo.Name
+            
+            # Check if AMI result is null or empty
+            if (-not $ami) {
+                throw "AWS API returned null/empty result for AMI ${AmiId}"
+            }
+            
+            # Handle case where $ami might be an array or single object
+            $firstAmi = $null
+            if ($ami -is [array] -and $ami.Count -gt 0) { 
+                $firstAmi = $ami[0] 
+            } elseif ($ami -is [array]) { 
+                throw "AWS API returned empty array for AMI ${AmiId}"
+            } else { 
+                $firstAmi = $ami 
+            }
+            
+            if ($firstAmi -and $firstAmi.ImageId) {
+                $amiName = "AMI No Name (${AmiId})"
+                if ($firstAmi.Name) { 
+                    $amiName = $firstAmi.Name.ToString().Trim()
+                }
+                
+                $description = 'N/A'
+                if ($firstAmi.Description) { 
+                    $description = $firstAmi.Description.ToString().Trim() 
+                }
+                
+                $architecture = 'N/A'
+                if ($firstAmi.Architecture) { 
+                    $architecture = $firstAmi.Architecture.ToString().Trim() 
+                }
+                
+                $platform = 'N/A'
+                if ($firstAmi.PlatformDetails) { 
+                    $platform = $firstAmi.PlatformDetails.ToString().Trim() 
+                }
+                
+                $creationDate = 'N/A'
+                if ($firstAmi.CreationDate) { 
+                    $creationDate = $firstAmi.CreationDate.ToString().Trim() 
+                }
+                
+                $ownerId = 'N/A'
+                if ($firstAmi.OwnerId) { 
+                    $ownerId = $firstAmi.OwnerId.ToString().Trim() 
+                }
+                
+                $state = 'N/A'
+                if ($firstAmi.State) { 
+                    $state = $firstAmi.State.ToString().Trim() 
+                }
+                
+                $public = $false
+                if ($null -ne $firstAmi.Public) { 
+                    $public = $firstAmi.Public 
+                }
+                
+                $amiInfo = @{ 
+                    Name = $amiName
+                    Description = $description
+                    Architecture = $architecture
+                    Platform = $platform
+                    CreationDate = $creationDate
+                    OwnerId = $ownerId
+                    State = $state
+                    Public = $public
+                }
+                $local_amiCache.TryAdd($cacheKey, $amiInfo)
+                return $amiName
+            } else {
+                Write-Log "AMI ${AmiId} exists but has no valid ImageId property. Available properties: $($firstAmi | Get-Member -MemberType Properties | Select-Object -ExpandProperty Name | Join-String -Separator ', ')" "WARN"
+                throw "AMI data is invalid - missing ImageId property"
+            }
         } catch {
-            $amiInfo = @{ Name = "AMI Query Error (${AmiId})"; Description = 'Error'; Architecture = 'N/A'; Platform = 'N/A'; CreationDate = 'N/A'; OwnerId = 'N/A'; State = 'N/A'; Public = $false }
+            $errorMessage = $_.Exception.Message
+            Write-Log "Failed to get AMI details for ${AmiId}: ${errorMessage}" "WARN"
+            
+            # Check if this is a specific AWS error
+            if ($errorMessage -like "*InvalidAMIID*" -or $errorMessage -like "*does not exist*") {
+                Write-Log "AMI ${AmiId} appears to be invalid or deleted" "WARN"
+            } elseif ($errorMessage -like "*null/empty*" -or $errorMessage -like "*empty array*") {
+                Write-Log "AWS API returned no data for AMI ${AmiId} - may be in different region or deleted" "WARN"
+            }
+            
+            $errorName = "AMI Query Error (${AmiId})"
+            $amiInfo = @{ 
+                Name = $errorName
+                Description = 'Error'
+                Architecture = 'N/A'
+                Platform = 'N/A'
+                CreationDate = 'N/A'
+                OwnerId = 'N/A'
+                State = 'N/A'
+                Public = $false 
+            }
             $local_amiCache.TryAdd($cacheKey, $amiInfo)
-            return $amiInfo.Name
+            return $errorName
         }
     }
 
@@ -431,8 +556,8 @@ $results = $AwsProfiles | ForEach-Object -Parallel {
             $ownerProfile = $AccountProfileCache["${VpcOwnerId}:${Region}"]
             if ($ownerProfile) { $profilesToTry = @($ownerProfile) + $profilesToTry }
         }
-        foreach ($profile in $profilesToTry) {
-            $subnet = Invoke-AwsApiCall -ApiCall { Get-EC2Subnet -SubnetId $SubnetId -ProfileName $profile -Region $Region -ErrorAction Stop } -ProfileName $profile -Region $Region -OperationDescription "Get subnet $SubnetId"
+        foreach ($awsprofile in $profilesToTry) {
+            $subnet = Invoke-AwsApiCall -ApiCall { Get-EC2Subnet -SubnetId $SubnetId -ProfileName $awsprofile -Region $Region -ErrorAction Stop } -ProfileName $awsprofile -Region $Region -OperationDescription "Get subnet $SubnetId"
             if ($subnet) {
                 $subnetInfo = @{ CidrBlock = $subnet.CidrBlock ?? 'N/A'; SubnetName = ($subnet.Tags | Where-Object { $_.Key -eq 'Name' } | Select-Object -ExpandProperty Value) ?? 'N/A' }
                 [System.Threading.Monitor]::Enter($SubnetCache)
@@ -454,8 +579,8 @@ $results = $AwsProfiles | ForEach-Object -Parallel {
         [System.Threading.Monitor]::Enter($VpcCache)
         try { if ($VpcCache.ContainsKey($cacheKey)) { return $VpcCache[$cacheKey] } } finally { [System.Threading.Monitor]::Exit($VpcCache) }
         $profilesToTry = @($ProfileName) + ($AvailableProfiles | Where-Object { $_ -ne $ProfileName })
-        foreach ($profile in $profilesToTry) {
-            $vpc = Invoke-AwsApiCall -ApiCall { Get-EC2VPC -VpcId $VpcId -ProfileName $profile -Region $Region -ErrorAction Stop } -ProfileName $profile -Region $Region -OperationDescription "Get VPC $VpcId"
+        foreach ($awsvpcprofile in $profilesToTry) {
+            $vpc = Invoke-AwsApiCall -ApiCall { Get-EC2VPC -VpcId $VpcId -ProfileName $awsvpcprofile -Region $Region -ErrorAction Stop } -ProfileName $awsvpcprofile -Region $Region -OperationDescription "Get VPC $VpcId"
             if ($vpc -and $vpc.OwnerId) {
                 [System.Threading.Monitor]::Enter($VpcCache)
                 try { $VpcCache[$cacheKey] = $vpc.OwnerId } finally { [System.Threading.Monitor]::Exit($VpcCache) }
@@ -549,11 +674,67 @@ $results = $AwsProfiles | ForEach-Object -Parallel {
             $instancesUsingAmi = $InstanceData | Where-Object { $_.AMIId -eq $amiId }
             $instanceCount = $instancesUsingAmi.Count
             $cacheKey = "${ProfileName}:${Region}:${amiId}"
-            $amiInfo = $local_amiCache[$cacheKey] ?? @{ Name = "AMI Query Error (${amiId})"; Description = 'Error'; Architecture = 'N/A'; Platform = 'N/A'; CreationDate = 'N/A'; OwnerId = 'N/A'; State = 'N/A'; Public = $false }
+            
+            # Get AMI info from cache with proper defaults and string conversion
+            $amiInfo = $null
+            if ($local_amiCache.ContainsKey($cacheKey)) { 
+                $amiInfo = $local_amiCache[$cacheKey] 
+            } else { 
+                $amiInfo = @{ 
+                    Name = "AMI Query Error (${amiId})"
+                    Description = 'Error'
+                    Architecture = 'N/A'
+                    Platform = 'N/A'
+                    CreationDate = 'N/A'
+                    OwnerId = 'N/A'
+                    State = 'N/A'
+                    Public = $false 
+                } 
+            }
+            
             $accountBreakdown = $instancesUsingAmi | Group-Object AccountName | ForEach-Object { "$($_.Name):$($_.Count)" } | Join-String -Separator '; '
             $instanceTypeBreakdown = $instancesUsingAmi | Group-Object InstanceType | ForEach-Object { "$($_.Name):$($_.Count)" } | Join-String -Separator '; '
             $stateBreakdown = $instancesUsingAmi | Group-Object InstanceState | ForEach-Object { "$($_.Name):$($_.Count)" } | Join-String -Separator '; '
-            $amiReport += [PSCustomObject]@{ AMIId = $amiId; AMIName = $amiInfo.Name; Description = $amiInfo.Description; Architecture = $amiInfo.Architecture; Platform = $amiInfo.Platform; CreationDate = $amiInfo.CreationDate; OwnerId = $amiInfo.OwnerId; State = $amiInfo.State; Public = $amiInfo.Public; InstanceCount = $instanceCount; Region = $Region; SSORole = Get-SSORoleName -ProfileName $ProfileName -Region $Region; AccountBreakdown = $accountBreakdown; InstanceTypeBreakdown = $instanceTypeBreakdown; StateBreakdown = $stateBreakdown }
+            
+            # Convert all AMI properties to strings safely
+            $amiName = $amiInfo.Name
+            if ($amiName -isnot [string]) { $amiName = $amiName.ToString().Trim() }
+            
+            $amiDescription = $amiInfo.Description
+            if ($amiDescription -isnot [string]) { $amiDescription = $amiDescription.ToString().Trim() }
+            
+            $amiArchitecture = $amiInfo.Architecture
+            if ($amiArchitecture -isnot [string]) { $amiArchitecture = $amiArchitecture.ToString().Trim() }
+            
+            $amiPlatform = $amiInfo.Platform
+            if ($amiPlatform -isnot [string]) { $amiPlatform = $amiPlatform.ToString().Trim() }
+            
+            $amiCreationDate = $amiInfo.CreationDate
+            if ($amiCreationDate -isnot [string]) { $amiCreationDate = $amiCreationDate.ToString().Trim() }
+            
+            $amiOwnerId = $amiInfo.OwnerId
+            if ($amiOwnerId -isnot [string]) { $amiOwnerId = $amiOwnerId.ToString().Trim() }
+            
+            $amiState = $amiInfo.State
+            if ($amiState -isnot [string]) { $amiState = $amiState.ToString().Trim() }
+            
+            $amiReport += [PSCustomObject]@{ 
+                AMIId = $amiId
+                AMIName = $amiName
+                Description = $amiDescription
+                Architecture = $amiArchitecture
+                Platform = $amiPlatform
+                CreationDate = $amiCreationDate
+                OwnerId = $amiOwnerId
+                State = $amiState
+                Public = $amiInfo.Public
+                InstanceCount = $instanceCount
+                Region = $Region
+                SSORole = Get-SSORoleName -ProfileName $ProfileName -Region $Region
+                AccountBreakdown = $accountBreakdown
+                InstanceTypeBreakdown = $instanceTypeBreakdown
+                StateBreakdown = $stateBreakdown 
+            }
         }
         Write-Log "Generated AMI report with $($amiReport.Count) unique AMIs for profile ${ProfileName}"
         return $amiReport
@@ -602,7 +783,7 @@ foreach ($result in $results) {
     $amiReport = $result.AmiReport
     $accountInfo = $result.AccountInfo
     $regions = $result.Regions
-    if ($profileInstances) { foreach ($instance in $profileInstances) { $outputBag.Add($instance) } }
+    # Note: profileInstances are already added to outputBag in the parallel block, so we don't add them again here
     if ($amiReport) { foreach ($report in $amiReport) { $allAmiReports.Add($report) } }
     if ($accountInfo) { $processedAccounts.Add($accountInfo) }
     foreach ($region in $regions) { if (-not ($regionsUsed | Where-Object { $_ -eq $region })) { $regionsUsed.Add($region) } }
