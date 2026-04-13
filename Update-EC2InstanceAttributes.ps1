@@ -49,7 +49,7 @@ param (
 # Determine the script's root directory for reliable path resolution
 $ScriptPath = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 $ExcelFilePath = (Join-Path $ScriptPath "EC2_Config.xlsx")
-$LogFilePath = (Join-Path $ScriptPath "logs\EC2_Update_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log")
+$LogFilePath = (Join-Path $ScriptPath "output\EC2_Update_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log")
 
 # Function to write logs
 function Write-Log {

@@ -61,6 +61,8 @@
 param (
     [Parameter(Mandatory=$true, HelpMessage="Path to the directory containing AWS.Tools and ImportExcel modules.")]
     [string]$PSModulesPath,
+    [Parameter(Mandatory=$false, HelpMessage="Path to the Excel file containing security group configuration.")]
+    [string]$ExcelFilePath,
     [Parameter(Mandatory=$false, HelpMessage="Run in dry run mode to simulate actions without modifying AWS resources.")]
     [switch]$DryRun,
     [Parameter(Mandatory=$false, HelpMessage="Delete and recreate existing security groups before adding rules.")]
@@ -73,7 +75,10 @@ param (
 
 # Determine the script's root directory for reliable path resolution
 $ScriptPath = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
-$ExcelFilePath = (Join-Path $ScriptPath "EC2_Config.xlsx")
+# If ExcelFilePath is not provided, use the default path
+if (-not $ExcelFilePath -or [string]::IsNullOrWhiteSpace($ExcelFilePath)) {
+    $ExcelFilePath = (Join-Path $ScriptPath "EC2_Config.xlsx")
+}
 $LogFilePath = (Join-Path $ScriptPath "logs\SG_Create_Log_$(Get-Date -Format 'yyyyMMdd_HHmmss').log")
 
 # Function to write logs

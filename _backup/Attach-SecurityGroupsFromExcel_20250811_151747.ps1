@@ -85,68 +85,6 @@ function Write-Log {
     Add-Content -Path $LogFilePath -Value $logMessage
 }
 
-# Function to update Excel file with error notes
-function Update-ExcelErrorNotes {
-    param (
-        [string]$InstanceName,
-        [string]$InstanceId,
-        [string]$ErrorMessage
-    )
-    try {
-        if ($DryRun) {
-            Write-Log "Dry run: Would update Excel file with error note '$ErrorMessage' for InstanceName '$InstanceName', InstanceId '$InstanceId'" "INFO"
-            return
-        }
-
-        Write-Log "Updating Excel file with error note for InstanceName '$InstanceName', InstanceId '$InstanceId'" "DEBUG"
-        $excelPackage = Open-ExcelPackage -Path $ExcelFilePath -ErrorAction Stop
-        $worksheet = $excelPackage.Workbook.Worksheets["sg_attach"]
-        if (-not $worksheet) {
-            throw "Worksheet 'sg_attach' not found in Excel file"
-        }
-
-        # Get headers
-        $headers = @{}
-        for ($col = 1; $col -le $worksheet.Dimension.Columns; $col++) {
-            $header = $worksheet.Cells[1, $col].Value
-            if ($header) {
-                $headers[$header] = $col
-            }
-        }
-
-        # Add Output_Notes column if it doesn't exist
-        if (-not $headers.ContainsKey('Output_Notes')) {
-            Write-Log "Output_Notes column not found in Excel worksheet. Adding it." "INFO"
-            $newCol = $worksheet.Dimension.Columns + 1
-            $worksheet.Cells[1, $newCol].Value = 'Output_Notes'
-            $headers['Output_Notes'] = $newCol
-        }
-
-        # Find the row for the configuration and update Output_Notes
-        $rowFound = $false
-        for ($row = 2; $row -le $worksheet.Dimension.Rows; $row++) {
-            $rowInstanceName = $worksheet.Cells[$row, $headers['InstanceName']].Value
-            $rowInstanceId = if ($headers.ContainsKey('InstanceId')) { $worksheet.Cells[$row, $headers['InstanceId']].Value } else { $null }
-            if (($InstanceName -and $rowInstanceName -eq $InstanceName) -or ($InstanceId -and $rowInstanceId -eq $InstanceId)) {
-                $worksheet.Cells[$row, $headers['Output_Notes']].Value = $ErrorMessage
-                Write-Log "Updated row $row, Output_Notes column with error: '$ErrorMessage'" "DEBUG"
-                $rowFound = $true
-                break
-            }
-        }
-
-        if ($rowFound) {
-            Close-ExcelPackage -ExcelPackage $excelPackage -ErrorAction Stop
-            Write-Log "Successfully updated Excel file with error note for InstanceName '$InstanceName', InstanceId '$InstanceId'" "INFO"
-        } else {
-            Close-ExcelPackage -ExcelPackage $excelPackage -ErrorAction Stop
-            Write-Log "No row found with InstanceName '$InstanceName' or InstanceId '$InstanceId' to update error notes" "WARN"
-        }
-    } catch {
-        Write-Log "Failed to update Excel file with error note. Error: $($_.Exception.Message)" "ERROR"
-    }
-}
-
 # Function to validate SSO session
 function Test-SSOSession {
     param(
@@ -460,27 +398,21 @@ try {
                 if (-not $DryRun) {
                     Set-AWSCredential -ProfileName $profileName -ErrorAction Stop
                     if (-not (Test-SSOSession -ProfileName $profileName -Region $region)) {
-                        $errorMsg = "Invalid SSO session for profile $profileName in region $region"
                         Write-Log "Skipping security group attachment for InstanceName $instanceName, InstanceId $instanceId due to invalid SSO session." "ERROR"
-                        Update-ExcelErrorNotes -InstanceName $instanceName -InstanceId $instanceId -ErrorMessage $errorMsg
                         continue
                     }
                     Set-DefaultAWSRegion -Region $region -ErrorAction Stop
                 }
                 Write-Log "Successfully set credentials and region ($region) for profile: $profileName"
             } catch {
-                $errorMsg = "Failed to set credentials for profile: $profileName. Error: $($_.Exception.Message)"
-                Write-Log $errorMsg "ERROR"
-                Update-ExcelErrorNotes -InstanceName $instanceName -InstanceId $instanceId -ErrorMessage $errorMsg
+                Write-Log "Failed to set credentials for profile: $profileName. Error: $($_.Exception.Message)" "ERROR"
                 continue
             }
 
             # Run preflight checks
             $preflightResult = Invoke-PreflightChecks -Config $config -ProfileName $profileName -Region $region
             if (-not $preflightResult) {
-                $errorMsg = "Preflight checks failed for configuration with InstanceName $instanceName, InstanceId $instanceId. Skipping attachment."
-                Write-Log $errorMsg "ERROR"
-                Update-ExcelErrorNotes -InstanceName $instanceName -InstanceId $instanceId -ErrorMessage $errorMsg
+                Write-Log "Preflight checks failed for configuration with InstanceName $instanceName, InstanceId $instanceId. Skipping attachment." "ERROR"
                 continue
             }
             $resolvedInstanceId = $preflightResult.InstanceId
@@ -495,7 +427,6 @@ try {
                     # Get current security groups
                     $instance = Get-EC2Instance -ProfileName $profileName -Region $region -InstanceId $resolvedInstanceId -ErrorAction Stop
                     $currentSgIds = $instance.Instances[0].SecurityGroups | ForEach-Object { $_.GroupId }
-                    Write-Log "Instance $resolvedInstanceId currently has $($currentSgIds.Count) security groups attached: $($currentSgIds -join ', ')" "INFO"
                     # Filter out already attached security groups
                     $sgsToAttach = [string[]]($securityGroupIds | Where-Object { $_ -notin $currentSgIds })
                     # Combine current and new security groups into a new array
@@ -510,9 +441,7 @@ try {
                     $newSgIds = [string[]]($newSgIds | Sort-Object | Select-Object -Unique)
                     # Check security group limit (AWS allows up to 5 security groups per network interface)
                     if ($newSgIds.Count -gt 20) {
-                        $errorMsg = "Cannot attach security groups to instance $resolvedInstanceId. Total security groups ($($newSgIds.Count)) exceeds AWS limit of 20."
-                        Write-Log $errorMsg "ERROR"
-                        Update-ExcelErrorNotes -InstanceName $instanceName -InstanceId $instanceId -ErrorMessage $errorMsg
+                        Write-Log "Cannot attach security groups to instance $resolvedInstanceId. Total security groups ($($newSgIds.Count)) exceeds AWS limit of 20." "ERROR"
                         continue
                     }
                     Write-Log "Current security groups: $($currentSgIds -join ', ')" "DEBUG"
@@ -532,9 +461,7 @@ try {
                         Write-Log "Successfully attached security groups $($sgsToAttach -join ', ') to instance $resolvedInstanceId" "INFO"
                     }
                 } catch {
-                    $errorMsg = "Failed to attach security groups to instance $resolvedInstanceId. Error: $($_.Exception.Message)"
-                    Write-Log $errorMsg "ERROR"
-                    Update-ExcelErrorNotes -InstanceName $instanceName -InstanceId $instanceId -ErrorMessage $errorMsg
+                    Write-Log "Failed to attach security groups to instance $resolvedInstanceId. Error: $($_.Exception.Message)" "ERROR"
                     continue
                 }
             }
@@ -585,10 +512,6 @@ try {
                         } else {
                             $worksheet.Cells[$row, $headers['AttachedSecurityGroupIds']].Value = $securityGroupIds -join ','
                             $worksheet.Cells[$row, $headers['InstanceId']].Value = $resolvedInstanceId
-                            # Clear any previous error notes on successful operation
-                            if ($headers.ContainsKey('Output_Notes')) {
-                                $worksheet.Cells[$row, $headers['Output_Notes']].Value = ""
-                            }
                             Write-Log "Updated row $row, column AttachedSecurityGroupIds with value '$($securityGroupIds -join ',')' and InstanceId with '$resolvedInstanceId' for InstanceName '$instanceName', InstanceId '$instanceId'" "DEBUG"
                         }
                         $rowFound = $true
@@ -635,9 +558,7 @@ try {
             }
 
         } catch {
-            $errorMsg = "Error processing configuration for Account: $accountId ($accountName), VpcID: $vpcId, InstanceName: $instanceName, InstanceId: $instanceId. Error: $($_.Exception.Message)"
-            Write-Log $errorMsg "ERROR"
-            Update-ExcelErrorNotes -InstanceName $instanceName -InstanceId $instanceId -ErrorMessage $errorMsg
+            Write-Log "Error processing configuration for Account: $accountId ($accountName), VpcID: $vpcId, InstanceName: $instanceName, InstanceId: $instanceId. Error: $($_.Exception.Message)" "ERROR"
             if (-not $DryRun) {
                 Clear-AWSCredential -ErrorAction SilentlyContinue
                 Clear-DefaultAWSRegion -ErrorAction SilentlyContinue

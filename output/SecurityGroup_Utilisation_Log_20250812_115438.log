@@ -1,0 +1,4 @@
+[2025-08-12 11:54:41] [ERROR] Failed to import AWS Tools modules from C:\Development\binaries\psmodules: The required module 'AWS.Tools.Common' is not loaded. Load the module or remove the module from 'RequiredModules' in the file 'C:\Development\binaries\psmodules\AWS.Tools.EC2\5.0.14\AWS.Tools.EC2.psd1'.
+[2025-08-12 11:54:41] [INFO] Retrieving CIDR blocks for prefix list pl-12345678
+[2025-08-12 11:54:41] [WARN] Failed to retrieve prefix list pl-12345678 : The term 'Get-EC2PrefixList' is not recognized as a name of a cmdlet, function, script file, or executable program.
+Check the spelling of the name, or if a path was included, verify that the path is correct and try again.

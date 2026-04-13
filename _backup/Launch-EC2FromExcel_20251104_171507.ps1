@@ -91,31 +91,6 @@ function Convert-ToNormalizedString {
     return $null
 }
 
-# Helper function to convert various truthy/falsey inputs to boolean
-function Convert-ToBoolean {
-    param(
-        $Value
-    )
-    if ($Value -is [bool]) { return $Value }
-    if ($null -eq $Value) { return $false }
-    try {
-        $s = ($Value | Out-String).Trim().ToLower()
-    } catch {
-        return [bool]$Value
-    }
-    switch ($s) {
-        'true' { return $true }
-        'yes' { return $true }
-        'y' { return $true }
-        '1' { return $true }
-        'false' { return $false }
-        'no' { return $false }
-        'n' { return $false }
-        '0' { return $false }
-        default { return [bool]$Value }
-    }
-}
-
 # Helper function to check if a given IP address is within a CIDR block
 function Test-IpInCidr {
     param(
@@ -362,7 +337,6 @@ function Invoke-PreflightChecks {
                 AvailableIpAddressCount = 10
                 CidrBlock = "172.31.0.0/16"
                 VpcId = "vpc-1234567890abcdef0"
-                AvailabilityZone = "dryrun-az-1a"
             }
         } else {
             try {
@@ -377,17 +351,6 @@ function Invoke-PreflightChecks {
         if ($subnetInfo.AvailableIpAddressCount -eq 0) {
             Write-Log "Subnet '$subnetId' has no available IP addresses." "ERROR"
             return @{ Success = $false }
-        }
-
-        # Validate AvailabilityZone if provided in Excel
-        if ($Config.AvailabilityZone) {
-            $subnetAz = $subnetInfo.AvailabilityZone
-            if ($subnetAz -and ($Config.AvailabilityZone -ne $subnetAz)) {
-                Write-Log "AvailabilityZone '$($Config.AvailabilityZone)' does not match subnet '$subnetId' AZ '$subnetAz'." "ERROR"
-                return @{ Success = $false }
-            } else {
-                Write-Log "AvailabilityZone validation passed or not applicable for subnet '$subnetId'." "DEBUG"
-            }
         }
 
         if ($privateIp) {
@@ -511,18 +474,7 @@ function Invoke-PreflightChecks {
         return @{ Success = $false }
     }
 
-    # --- SR-IOV Value Normalization & Compatibility Check ---
-    if ($Config.SriovNetSupport) {
-        $sriVal = (($Config.SriovNetSupport | Out-String).Trim()).ToLower()
-        if ($sriVal -eq 'simple') {
-            $Config.SriovNetSupport = 'simple'
-        } elseif ([string]::IsNullOrWhiteSpace($sriVal) -or $sriVal -eq 'none') {
-            $Config.SriovNetSupport = $null
-        } else {
-            Write-Log "Unsupported SriovNetSupport value '$($Config.SriovNetSupport)'. Expected 'simple' or blank. Skipping." "WARN"
-            $Config.SriovNetSupport = $null
-        }
-    }
+    # --- SR-IOV Compatibility Check ---
     if ($Config.SriovNetSupport) {
         Write-Log "Checking SR-IOV compatibility for instance type '$instanceType'..."
         if ($SRIOVCompatibleTypes.Count -gt 0 -and $instanceType -notin $SRIOVCompatibleTypes) {
@@ -530,42 +482,6 @@ function Invoke-PreflightChecks {
             $Config.SriovNetSupport = $null # Clear to skip post-launch configuration
         } else {
             Write-Log "Instance type '$instanceType' supports SR-IOV. Will apply SriovNetSupport ('$($Config.SriovNetSupport)') post-launch."
-        }
-    }
-
-    # --- Dedicated Tenancy / Host Checks ---
-    if ($Config.Tenancy) {
-        $ten = (($Config.Tenancy | Out-String).Trim()).ToLower()
-        if ($ten -eq 'host') {
-            if (-not $Config.HostId) {
-                Write-Log "Tenancy=host requires HostId to be specified in Excel." "ERROR"
-                return @{ Success = $false }
-            }
-            if ($DryRun) {
-                Write-Log "Dry run: Assuming Dedicated Host '$($Config.HostId)' exists and AZ matches subnet." "INFO"
-            } else {
-                try {
-                    $host = Get-EC2Host -ProfileName $ProfileName -Region $Region -HostId $Config.HostId -ErrorAction Stop
-                } catch {
-                    Write-Log "Failed to describe Dedicated Host '$($Config.HostId)'. Error: $($_.Exception.Message)" "ERROR"
-                    return @{ Success = $false }
-                }
-                if (-not $host) {
-                    Write-Log "Dedicated Host '$($Config.HostId)' not found." "ERROR"
-                    return @{ Success = $false }
-                }
-                $hostAz = $host.AvailabilityZone
-                $subnetAz = $subnetInfo.AvailabilityZone
-                if ($hostAz -and $subnetAz -and ($hostAz -ne $subnetAz)) {
-                    Write-Log "Dedicated Host AZ '$hostAz' does not match Subnet AZ '$subnetAz'." "ERROR"
-                    return @{ Success = $false }
-                }
-            }
-        } elseif ($ten -eq 'dedicated' -or $ten -eq 'default') {
-            # no additional preflight required
-        } else {
-            Write-Log "Invalid Tenancy value '$($Config.Tenancy)'. Expected 'default', 'dedicated', or 'host'." "ERROR"
-            return @{ Success = $false }
         }
     }
 
@@ -826,14 +742,10 @@ try {
                 $launchParams.IamInstanceProfile_Name = $config.IamInstanceProfile
             }
 
-            # Placement (Tenancy / Dedicated Host / Affinity / AZ)
-            if ($config.Tenancy) { $launchParams.Placement_Tenancy = $config.Tenancy }
-            if ($config.Tenancy -and ($config.Tenancy.ToLower() -eq 'host') -and $config.HostId) { $launchParams.Placement_HostId = $config.HostId }
-            if ($config.Affinity) { $launchParams.Placement_Affinity = $config.Affinity }
-            if ($config.AvailabilityZone) { $launchParams.Placement_AvailabilityZone = $config.AvailabilityZone }
-
             # Add EBS Optimized
-            if (Convert-ToBoolean $config.EbsOptimized) { $launchParams.EbsOptimized = $true }
+            if ($config.EbsOptimized -eq 'true') {
+                $launchParams.EbsOptimized = $true
+            }
 
             # Add Block Device Mapping for Root Volume
             if ($config.RootVolumeSize -or $config.RootVolumeType -or $config.Encrypted) {
@@ -853,7 +765,9 @@ try {
             }
 
             # Add Monitoring
-            if (Convert-ToBoolean $config.Monitoring) { $launchParams.Monitoring_Enabled = $true }
+            if ($config.Monitoring -eq 'true') {
+                $launchParams.Monitoring_Enabled = $true
+            }
 
             # Add Metadata Options
             if ($config.MetadataOptionsHttpTokens) {
@@ -865,7 +779,9 @@ try {
             if ($config.MetadataOptionsHttpPutResponseHopLimit) {
                 $launchParams.MetadataOptions_HttpPutResponseHopLimit = [int]$config.MetadataOptionsHttpPutResponseHopLimit
             }
-            if (Convert-ToBoolean $config.InstanceMetadataTags) { $launchParams.MetadataOptions_InstanceMetadataTags = 'enabled' }
+            if ($config.InstanceMetadataTags -eq 'true') {
+                $launchParams.MetadataOptions_InstanceMetadataTags = 'enabled'
+            }
 
             # Add CPU Options
             if ($config.CpuCoreCount -or $config.CpuThreadsPerCore) {
@@ -876,7 +792,9 @@ try {
             }
 
             # Add Disable API Termination
-            if (Convert-ToBoolean $config.DisableApiTermination) { $launchParams.DisableApiTermination = $true }
+            if ($config.DisableApiTermination -eq 'true') {
+                $launchParams.DisableApiTermination = $true
+            }
 
             # Add Instance Initiated Shutdown Behavior
             if ($config.InstanceInitiatedShutdownBehavior) {
@@ -884,7 +802,9 @@ try {
             }
 
             # Add ENA Support
-            if (Convert-ToBoolean $config.EnaSupport) { $launchParams.EnaSupport = $true }
+            if ($config.EnaSupport -eq 'true') {
+                $launchParams.EnaSupport = $true
+            }
 
             # Add User Data
             if ($config.UserData) {
@@ -896,7 +816,7 @@ try {
                 $tags = @()
                 if ($config.Tags) {
                     Write-Log "Processing tags for instance $($config.InstanceName): $($config.Tags)" "DEBUG"
-                    $tagPairs = $config.Tags -split '[,;]' | ForEach-Object { $_.Trim() }
+                    $tagPairs = $config.Tags -split ',' | ForEach-Object { $_.Trim() }
                     foreach ($tagPair in $tagPairs) {
                         $keyValue = $tagPair -split '='
                         if ($keyValue.Count -eq 2 -and $keyValue[0].Trim() -and $keyValue[1].Trim()) {
